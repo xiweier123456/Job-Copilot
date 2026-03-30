@@ -1,0 +1,8 @@
+{"dependencies": [
+    "."
+  ],
+  "graphs": {
+    "job-copilot-agent": "./app/agents/graph.py:get_agent"
+  },
+  "env": ".env"
+}
