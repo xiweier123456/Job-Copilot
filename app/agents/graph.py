@@ -10,12 +10,17 @@ app/agents/graph.py
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, AsyncIterator
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, StoreBackend
@@ -25,6 +30,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 
 from app.config import settings
+from app.services.chat_history_service import build_history_context
 from app.agents.tools import (
     search_jobs_tool,
     analyze_resume_tool,
@@ -61,6 +67,57 @@ TRACE_CONTEXT_TOOL_PATTERN = re.compile(r'"tool_call"\s*:\s*\{\s*"name"\s*:\s*"(
 
 class AgentRunError(RuntimeError):
     """Raised when the deep agent run fails."""
+
+
+@dataclass
+class ActiveRun:#表示一个正在运行的 agent 实例，包含 run_id、session_id 和一个 asyncio.Event 用于取消运行
+    run_id: str
+    session_id: str
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+_ACTIVE_RUNS: dict[str, ActiveRun] = {}#全局字典，存储所有正在运行的 agent 实例，key 是 run_id，value 是 ActiveRun 对象
+
+
+def create_run(session_id: str) -> ActiveRun:#创建一个新的 agent 运行实例，生成唯一 run_id，并将其与 session_id 关联，存储在全局 _ACTIVE_RUNS 中
+    run = ActiveRun(run_id=uuid.uuid4().hex, session_id=session_id)
+    _ACTIVE_RUNS[run.run_id] = run
+    return run
+
+def get_run(run_id: str) -> ActiveRun | None:#根据 run_id 获取当前运行的 agent 实例，查看是否正在运行
+    return _ACTIVE_RUNS.get(run_id)
+
+
+def cancel_run(run_id: str) -> bool:#将当前运行的 agent 标记为取消，返回是否成功找到并标记
+    run = get_run(run_id)
+    if run is None:
+        return False
+    run.cancel_event.set()
+    return True
+
+
+def remove_run(run_id: str) -> None:#从全局 _ACTIVE_RUNS 中移除一个运行实例，通常在运行结束后调用
+    _ACTIVE_RUNS.pop(run_id, None)
+
+
+async def has_active_thread_memory(session_id: str) -> bool:
+    """检查这个 session 在 MemorySaver 里是否已有可继续复用的 thread checkpoint。"""
+    checkpointer = get_checkpointer()
+    checkpoint = await checkpointer.aget_tuple({"configurable": {"thread_id": session_id}})
+    return checkpoint is not None
+
+
+async def clear_session_runtime_state(session_id: str) -> None:
+    """
+    清掉某个 session 的运行时线程状态。
+    这里删的是 checkpointer 里的 thread checkpoint，并顺手取消该 session 下正在跑的 run。
+    """
+    checkpointer = get_checkpointer()
+    await checkpointer.adelete_thread(session_id)
+
+    for run in list(_ACTIVE_RUNS.values()):
+        if run.session_id == session_id:
+            run.cancel_event.set()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -160,11 +217,21 @@ def _build_model():
 
 
 @lru_cache(maxsize=1)
+def get_checkpointer():
+    return MemorySaver()
+
+
+@lru_cache(maxsize=1)
+def get_store():
+    return InMemoryStore()
+
+
+@lru_cache(maxsize=1)
 def get_agent():
     """单例创建 deep agent，避免每次请求重复初始化。"""
     model = _build_model()
-    checkpointer = MemorySaver()
-    store = InMemoryStore()
+    checkpointer = get_checkpointer()
+    store = get_store()
 
     def _make_backend(runtime):
         return CompositeBackend(
@@ -172,7 +239,7 @@ def get_agent():
             routes={
                 str(MEMORY_ROOT): StoreBackend(runtime),
             },
-            
+
         )
 
     # ═══════════════════════════════════════════════════════════════
@@ -743,37 +810,117 @@ def _extract_reply(result: dict[str, Any]) -> str:
     return "抱歉，我暂时无法从 agent 结果中提取有效回复。"
 
 
-async def run_agent(message: str, session_id: str = "default") -> dict[str, Any]:
-    """运行主 agent，并返回可直接给 API 层使用的结构化结果。"""
-    agent = get_agent()
-    start = perf_counter()
-    final_result: dict[str, Any] | None = None
-    event_texts: list[str] = []
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    try:
-        async for event in agent.astream_events(
-            {
-                "messages": [{"role": "user", "content": message}],
-                "metadata": {"session_id": session_id},
-            },
-            config={"configurable": {"thread_id": session_id},
-                    "recursion_limit": 100},
-            version="v2",
-        ):
-            event_text = str(event)
-            event_texts.append(event_text)
 
-            if event.get("event") == "on_chain_end" and event.get("name") == "job-copilot-agent":
-                data = event.get("data") or {}
-                output = data.get("output")
-                if isinstance(output, dict):
-                    final_result = output
-    except Exception as exc:
-        latency_ms = round((perf_counter() - start) * 1000, 2)
-        logger.exception("Agent run failed for session %s", session_id)
-        raise AgentRunError("agent 运行失败，请稍后重试。") from exc
+def _extract_todo_items(text: str) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
 
-    result = final_result or {}
+    for status in ("in_progress", "pending", "completed"):
+        pattern = re.compile(
+            rf"['\"]content['\"]:\s*['\"]([^'\"]+)['\"].*?['\"]status['\"]:\s*['\"]{status}['\"]"
+        )
+        for content in pattern.findall(text):
+            item = {"content": content.strip(), "status": status}
+            if item not in items:
+                items.append(item)
+
+    return items
+
+
+def _build_stream_event(
+    event_type: str,
+    session_id: str,
+    run_id: str,
+    sequence: int,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "type": event_type,
+        "session_id": session_id,
+        "run_id": run_id,
+        "sequence": sequence,
+        "timestamp": _utc_timestamp(),
+        "payload": payload,
+    }
+
+
+def _build_runtime_message(message: str, history_context: str) -> str:
+    # thread_id=session_id 负责正常连续对话的主路径。
+    # transcript 只在“当前进程内没有可用线程记忆”时作为恢复兜底，避免每轮都把同一份历史重复注入。
+    if not history_context:
+        return message
+    return f"{history_context}\n\n{message}".strip()
+
+
+def _normalize_event(
+    event: dict[str, Any],
+    session_id: str,
+    run_id: str,
+    sequence: int,
+    seen_subagents: set[str],
+    seen_todos: set[str],
+) -> dict[str, Any] | None:
+    event_name = event.get("event")
+    name = event.get("name")
+    event_text = json.dumps(event, ensure_ascii=False, default=str)
+
+    todo_items = _extract_todo_items(event_text)
+    if todo_items:
+        todo_key = json.dumps(todo_items, ensure_ascii=False, sort_keys=True)
+        if todo_key not in seen_todos:
+            seen_todos.add(todo_key)
+            return _build_stream_event(
+                "todo",
+                session_id,
+                run_id,
+                sequence,
+                {"items": todo_items},
+            )
+
+    if event_name == "on_tool_start" and name == "task":
+        return _build_stream_event(
+            "status",
+            session_id,
+            run_id,
+            sequence,
+            {"stage": "thinking", "message": "正在规划并拆解任务"},
+        )
+
+    if event_name == "on_tool_start" and isinstance(name, str) and name != "task":
+        return _build_stream_event(
+            "tool",
+            session_id,
+            run_id,
+            sequence,
+            {"name": name, "status": "started"},
+        )
+
+    if event_name == "on_tool_end" and isinstance(name, str) and name != "task":
+        return _build_stream_event(
+            "tool",
+            session_id,
+            run_id,
+            sequence,
+            {"name": name, "status": "completed"},
+        )
+
+    for subagent_name in SUBAGENT_NAMES:
+        if subagent_name in event_text and subagent_name not in seen_subagents:
+            seen_subagents.add(subagent_name)
+            return _build_stream_event(
+                "subagent",
+                session_id,
+                run_id,
+                sequence,
+                {"name": subagent_name, "status": "started"},
+            )
+
+    return None
+
+
+def _build_final_response(result: dict[str, Any], session_id: str, event_texts: list[str], start: float) -> dict[str, Any]:
     messages = result.get("messages", [])
     reply = _extract_reply(result)
     used_subagents = _collect_used_subagents(messages, event_texts)
@@ -798,3 +945,117 @@ async def run_agent(message: str, session_id: str = "default") -> dict[str, Any]
         "latency_ms": latency_ms,
         "error": None,
     }
+
+
+async def stream_agent_events(
+    message: str,
+    session_id: str = "default",
+    run_id: str | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    agent = get_agent()
+    start = perf_counter()
+    final_result: dict[str, Any] | None = None
+    event_texts: list[str] = []
+    seen_subagents: set[str] = set()
+    seen_todos: set[str] = set()
+    sequence = 0
+    current_run_id = run_id or uuid.uuid4().hex
+    history_context = ""
+    if not await has_active_thread_memory(session_id):
+        history_context = await build_history_context(session_id)
+    runtime_message = _build_runtime_message(message, history_context)
+
+    yield _build_stream_event(
+        "status",
+        session_id,
+        current_run_id,
+        sequence,
+        {"stage": "started", "message": "已开始处理请求"},
+    )
+    sequence += 1
+
+    try:
+        async for event in agent.astream_events(
+            {
+                "messages": [{"role": "user", "content": runtime_message}],
+                "metadata": {"session_id": session_id, "run_id": current_run_id},
+            },
+            config={"configurable": {"thread_id": session_id}, "recursion_limit": 100},
+            version="v2",
+        ):
+            run = get_run(current_run_id)
+            if run and run.cancel_event.is_set():
+                yield _build_stream_event(
+                    "stopped",
+                    session_id,
+                    current_run_id,
+                    sequence,
+                    {"reason": "user_cancelled", "message": "生成已停止"},
+                )
+                return
+
+            event_text = str(event)
+            event_texts.append(event_text)
+
+            normalized = _normalize_event(event, session_id, current_run_id, sequence, seen_subagents, seen_todos)
+            if normalized is not None:
+                yield normalized
+                sequence += 1
+
+            if event.get("event") == "on_chain_end" and event.get("name") == "job-copilot-agent":
+                data = event.get("data") or {}
+                output = data.get("output")
+                if isinstance(output, dict):
+                    final_result = output
+    except asyncio.CancelledError:
+        yield _build_stream_event(
+            "stopped",
+            session_id,
+            current_run_id,
+            sequence,
+            {"reason": "client_disconnected", "message": "生成已停止"},
+        )
+        return
+    except Exception as exc:
+        logger.exception("Agent run failed for session %s", session_id)
+        yield _build_stream_event(
+            "error",
+            session_id,
+            current_run_id,
+            sequence,
+            {"message": "agent 运行失败，请稍后重试。"},
+        )
+        raise AgentRunError("agent 运行失败，请稍后重试。") from exc
+    finally:
+        remove_run(current_run_id)
+
+    yield _build_stream_event(
+        "status",
+        session_id,
+        current_run_id,
+        sequence,
+        {"stage": "finalizing", "message": "正在整理最终结果"},
+    )
+    sequence += 1
+
+    yield _build_stream_event(
+        "final",
+        session_id,
+        current_run_id,
+        sequence,
+        _build_final_response(final_result or {}, session_id, event_texts, start),
+    )
+
+
+async def run_agent(message: str, session_id: str = "default") -> dict[str, Any]:
+    """运行主 agent，并返回可直接给 API 层使用的结构化结果。"""
+    final_payload: dict[str, Any] | None = None
+
+    async for stream_event in stream_agent_events(message, session_id):
+        if stream_event["type"] == "final":
+            final_payload = stream_event["payload"]
+
+    if final_payload is None:
+        raise AgentRunError("agent 运行失败，请稍后重试。")
+
+    return final_payload

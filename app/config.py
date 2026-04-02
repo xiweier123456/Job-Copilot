@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     milvus_host: str = "localhost"
     milvus_port: int = 19530
     milvus_collection: str = "job_chunks"
+    milvus_chat_memory_collection: str = "chat_memory"
 
     # Embedding
     embedding_model: str = "BAAI/bge-small-zh-v1.5"

@@ -27,7 +27,7 @@ async def search_jobs(
     Returns:
         匹配岗位列表，每条包含岗位名、公司、城市、薪资、JD 摘要、相似度得分
     """
-    query_vector = embed_query(query)
+    query_vector = embed_query(query)# 将查询文本转换为向量
     hits = search_similar_jobs(
         query_vector=query_vector,
         top_k=top_k,

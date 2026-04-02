@@ -86,7 +86,7 @@ async def analyze_resume_match(request: ResumeMatchRequest) -> ResumeMatchRespon
             reference_jobs=[],
         )
 
-    jd_text = _format_jds(hits)
+    jd_text = _format_jds(hits)# 将参考岗位列表格式化为文本，供 LLM 分析使用
     user_prompt = MATCH_TEMPLATE.format(
         resume=request.resume_text[:2000],
         jd_count=len(hits),
