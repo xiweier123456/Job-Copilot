@@ -24,15 +24,6 @@ OUTPUT_FIELDS = [
     "status",
 ]
 
-MAX_MEMORY_TEXT_LENGTH = 4096
-
-
-def _fit_memory_text(text: str, max_length: int = MAX_MEMORY_TEXT_LENGTH) -> str:
-    """把待入库文本截断到 Milvus varchar 上限内，避免 insert 因超长失败。"""
-    if len(text) <= max_length:
-        return text
-    return text[: max_length - 1].rstrip() + "…"
-
 
 @lru_cache(maxsize=1)
 def _get_collection() -> Collection:
@@ -41,6 +32,34 @@ def _get_collection() -> Collection:
     collection = Collection(settings.milvus_chat_memory_collection)
     collection.load()
     return collection
+
+
+def _get_text_max_length(collection: Collection) -> int:
+    """读取当前 collection 的 text 字段上限，避免本地常量和实际 schema 不一致。"""
+    for field in collection.schema.fields:
+        if field.name == "text":
+            return int(field.params.get("max_length") or 4096)
+    return 4096
+
+
+def _fit_memory_text(text: str, max_length: int) -> str:
+    """把待入库文本截断到 Milvus varchar 上限内，避免 insert 因超长失败。"""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_length:
+        return text
+
+    ellipsis = "…"
+    ellipsis_bytes = len(ellipsis.encode("utf-8"))
+    clipped = encoded[: max_length - ellipsis_bytes]
+
+    while clipped:
+        try:
+            return clipped.decode("utf-8").rstrip() + ellipsis
+        except UnicodeDecodeError:
+            clipped = clipped[:-1]
+
+    return ellipsis if ellipsis_bytes <= max_length else ""
+
 
 
 async def save_chat_memory(turn: dict) -> None:
@@ -52,18 +71,24 @@ async def save_chat_memory(turn: dict) -> None:
     assistant_message = str(turn.get("assistant_message") or "").strip()
     status = str(turn.get("status") or "done").strip()
 
+    collection = _get_collection()
+    max_text_length = _get_text_max_length(collection)
+
     texts: list[str] = []
     role_scopes: list[str] = []
     memory_ids: list[str] = []
 
     if user_message:
-        texts.append(_fit_memory_text(user_message))
+        texts.append(_fit_memory_text(user_message, max_text_length))
         role_scopes.append("user")
         memory_ids.append(f"{turn['turn_id']}-user")
 
     # 文档入库使用 embed_texts()；未来查询时再用 embed_query()，保持文档侧和查询侧分工清晰。
     if status == "done" and assistant_message:
-        turn_text = _fit_memory_text(f"用户：{user_message}\n助手：{assistant_message}".strip())
+        turn_text = _fit_memory_text(
+            f"用户：{user_message}\n助手：{assistant_message}".strip(),
+            max_text_length,
+        )
         texts.append(turn_text)
         role_scopes.append("turn")
         memory_ids.append(f"{turn['turn_id']}-turn")
@@ -72,7 +97,6 @@ async def save_chat_memory(turn: dict) -> None:
         return
 
     vectors = embed_texts(texts)
-    collection = _get_collection()
     session_id = str(turn.get("session_id") or "default")
     created_at = str(turn.get("created_at") or "")
 

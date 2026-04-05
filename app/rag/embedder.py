@@ -1,7 +1,7 @@
 """
 app/rag/embedder.py
 本地 sentence-transformers embedding 封装。
-首次运行会自动下载模型（BAAI/bge-large-zh-v1.5，约 1.3GB）。
+默认从 E:/Study/model 加载本地模型。
 """
 from __future__ import annotations
 

@@ -26,13 +26,14 @@ Job Copilot combines RAG (Retrieval-Augmented Generation) with a multi-agent arc
 | **Live Web Augmentation** | Real-time search via Tavily API — pulls job postings and interview experiences from 牛客网, 知乎, etc. |
 | **MCP Integration** | Plug into Claude Desktop or any MCP-compatible client as a tool server |
 | **Multi-Agent Orchestration** | 4 specialized subagents coordinated by a central orchestrator via DeepAgents + LangGraph |
+| **Split Model Strategy** | DeepSeek handles RAG/service-side reasoning, while the deep-agent framework runs on Minimax |
 
 ## 🏗️ Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      User Interfaces                        │
-│         FastAPI (/chat, /jobs, /resume)  │  MCP (Claude)    │
+│         FastAPI (/chat, /jobs, /resume)  │   MCP             │
 └──────────────────────┬──────────────────────────────────────┘
                        │
               ┌────────▼────────┐
@@ -48,9 +49,9 @@ Job Copilot combines RAG (Retrieval-Augmented Generation) with a multi-agent arc
    └───┬────┘└───┬────┘└───┬────┘└───┬────┘
        │         │         │         │
   ┌────▼─────────▼─────────▼─────────▼────┐
-  │           Shared Tool Layer            │
-  │  Milvus RAG  │  LLM API  │  Tavily    │
-  └────────────────────────────────────────┘
+  │           Shared Tool Layer           │
+  │Milvus RAG+rerank│ LLM API │  Tavily   │
+  └───────────────────────────────────────┘
 ```
 
 ### Multi-Agent System
@@ -60,15 +61,15 @@ The core agent delegates every job-related query to one of 4 specialized subagen
 | Subagent | Responsibility | Tools |
 |----------|---------------|-------|
 | `job-search-agent` | Job retrieval, requirements analysis, market comparison | `search_jobs`, Tavily |
-| `resume-agent` | Resume-JD matching, skill gap identification | `analyze_resume`, Tavily |
-| `career-agent` | Career direction recommendations, preparation planning | `suggest_career_path`, Tavily |
-| `interview-agent` | Question generation, answer frameworks, real interview experiences | `interview_prep`, Tavily |
+| `resume-agent` | Resume-JD matching, skill gap identification | `search_jobs`, Tavily |
+| `career-agent` | Career direction recommendations, preparation planning | `search_jobs`, Tavily |
+| `interview-agent` | Interview preparation and real interview experiences | `search_jobs`, Tavily |
 
 ### RAG Pipeline
 
 ```
 CSV Data → Chunking (summary + sliding-window JD) → Embedding (bge-small-zh-v1.5)
-→ Milvus HNSW Index → Semantic Retrieval with scalar filters (city, industry, education)
+→ Milvus HNSW Index → Semantic Retrieval with scalar filters (city, industry, education) ->rerank ->LLM Self-Generation
 → LLM Generation with retrieved context
 ```
 
@@ -79,8 +80,10 @@ CSV Data → Chunking (summary + sliding-window JD) → Embedding (bge-small-zh-
 | Web Framework | **FastAPI** + Uvicorn |
 | Agent Framework | **DeepAgents** + LangGraph + LangChain |
 | Vector Database | **Milvus** (HNSW index, cosine similarity) |
-| Embeddings | **BAAI/bge-small-zh-v1.5** (512-dim, local inference) |
-| LLM | OpenAI-compatible API (**DeepSeek** / Zhipu GLM-4 / Tongyi Qwen) |
+| Embeddings | **BAAI/bge-small-zh-v1.5** (512-dim, local 
+inference) |
+| RERANK   | **BAAI-bge-reranker-v2-m3**|
+| LLM | Split remote chat models: **DeepSeek** for RAG/service-side flows, **Minimax** for DeepAgents runtime |
 | MCP Server | **FastMCP** (stdio / HTTP / SSE transport) |
 | Web Search | **Tavily** API |
 | Data Validation | **Pydantic** v2 |
@@ -111,9 +114,14 @@ cp .env.example .env
 Edit `.env` and fill in your API keys:
 
 ```env
-LLM_API_KEY=your-llm-api-key
-LLM_BASE_URL=https://api.deepseek.com/v1
-LLM_MODEL=deepseek-chat
+SERVICE_LLM_API_KEY=your-deepseek-api-key
+SERVICE_LLM_BASE_URL=https://api.deepseek.com/v1
+SERVICE_LLM_MODEL=deepseek-chat
+
+AGENT_LLM_API_KEY=your-minimax-api-key
+AGENT_LLM_BASE_URL=https://api.minimaxi.com/v1
+AGENT_LLM_MODEL=MiniMax-M1
+
 TAVILY_API_KEY=your-tavily-api-key     # optional
 ```
 
@@ -197,10 +205,11 @@ Connect to Claude Desktop or any MCP client to use these tools:
 
 | Tool | Description |
 |------|-------------|
-| `search_jobs` | Semantic job search with city/industry/education filters |
-| `analyze_resume_match` | Resume-JD fit analysis with skill gap identification |
-| `suggest_career_path` | Career direction recommendations based on background |
-| `generate_interview_prep` | Interview questions, answer frameworks, and prep checklists |
+| `search_jobs` | Semantic job search with city/industry filters and retrieval metadata |
+| `tavily_search` | Tavily web search for current market signals, articles, and interview experiences |
+| `tavily_research` | Multi-source Tavily research summary with source list |
+| `tavily_extract` | Extract clean content from one or more concrete URLs |
+| `batch_tavily_search` | Run multiple Tavily queries concurrently |
 
 ## 📁 Project Structure
 
@@ -216,7 +225,7 @@ job-copilot/
 │   │   └── chat.py             # POST /chat
 │   ├── agents/                 # Multi-agent orchestration
 │   │   ├── graph.py            # Agent graph definition & system prompts
-│   │   └── tools.py            # LangChain tool wrappers (8 tools)
+│   │   └── tools.py            # LangChain tool wrappers (search_jobs + Tavily)
 │   ├── mcp/                    # MCP protocol server
 │   │   ├── server.py           # FastMCP server entry
 │   │   └── tools/              # MCP tool implementations

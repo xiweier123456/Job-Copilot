@@ -3,10 +3,8 @@ app/mcp/tools/search_jobs.py
 MCP tool：语义检索相关岗位
 """
 from typing import Optional
-import asyncio
 
-from app.rag.embedder import embed_query
-from app.rag.retriever import search_similar_jobs
+from app.services.job_service import search_jobs_service_with_meta
 
 
 async def search_jobs(
@@ -27,30 +25,32 @@ async def search_jobs(
     Returns:
         匹配岗位列表，每条包含岗位名、公司、城市、薪资、JD 摘要、相似度得分
     """
-    query_vector = embed_query(query)# 将查询文本转换为向量
-    hits = search_similar_jobs(
-        query_vector=query_vector,
-        top_k=top_k,
+    result = await search_jobs_service_with_meta(
+        query=query,
         city=city,
         industry=industry,
-        chunk_type="description",
+        top_k=top_k,
     )
     items = [
         {
-            "job_title":   h["job_title"],
-            "company":     h["company"],
-            "industry":    h["industry"],
-            "city":        h["city"],
-            "salary":      f"{int(h['min_salary'])}-{int(h['max_salary'])} 元/月" if h["max_salary"] else "面议",
-            "education":   h["education"],
-            "experience":  h["experience"],
-            "description": h["text"][:400],
-            "score":       h["score"],
+            "job_title": h.job_title,
+            "company": h.company,
+            "industry": h.industry,
+            "city": h.city,
+            "salary": f"{int(h.min_salary)}-{int(h.max_salary)} 元/月" if h.max_salary else "面议",
+            "education": h.education,
+            "experience": h.experience,
+            "description": h.text[:400],
+            "score": h.rerank_score if h.rerank_score is not None else h.score,
         }
-        for h in hits
+        for h in result.items
     ]
+    summary = f"共检索到 {len(items)} 个相关岗位结果。"
+    if result.meta.rewritten:
+        summary += f" 系统已自动进行了 {result.meta.attempt_count} 轮检索优化。"
     return {
         "tool": "search_jobs",
-        "summary": f"共检索到 {len(items)} 个相关岗位结果。",
+        "summary": summary,
         "data": items,
+        "meta": result.meta.model_dump(),
     }

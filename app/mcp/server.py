@@ -14,9 +14,12 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from fastmcp import FastMCP
 from app.mcp.tools.search_jobs import search_jobs
-from app.mcp.tools.resume_match import analyze_resume_match
-from app.mcp.tools.career_path import suggest_career_path
-from app.mcp.tools.interview_prep import generate_interview_prep
+from app.mcp.tools.tavily import (
+    batch_tavily_search,
+    tavily_extract,
+    tavily_research,
+    tavily_search,
+)
 from app.config import settings
 MCP_TRANSPORT = settings.mcp_transport
 MCP_HOST = settings.mcp_host
@@ -26,15 +29,16 @@ mcp = FastMCP(
     name="job-copilot",
     instructions=(
         "求职助手 MCP Server，基于上市公司招聘数据（2024-2026）。\n"
-        "可以检索岗位、分析简历匹配度、推荐职业路径、生成面试准备建议。"
+        "当前提供岗位检索，以及 Tavily 联网搜索、深度研究、页面抽取能力。"
     ),
 )
 
 # 注册所有 tools
 mcp.tool()(search_jobs)
-mcp.tool()(analyze_resume_match)
-mcp.tool()(suggest_career_path)
-mcp.tool()(generate_interview_prep)
+mcp.tool()(tavily_search)
+mcp.tool()(tavily_research)
+mcp.tool()(tavily_extract)
+mcp.tool()(batch_tavily_search)
 
 if __name__ == "__main__":
     mcp.run(
