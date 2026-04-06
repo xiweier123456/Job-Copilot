@@ -1,6 +1,9 @@
 """
 app/mcp/tools/search_jobs.py
-MCP tool：语义检索相关岗位
+
+岗位语义检索的 MCP 工具封装。
+这个模块保持 MCP 层足够薄，只负责参数接收和结果整理，真正的检索、
+查询改写与重排逻辑下沉到 service 层。
 """
 from typing import Optional
 
@@ -13,17 +16,20 @@ async def search_jobs(
     industry: Optional[str] = None,
     top_k: int = 5,
 ) -> dict:
-    """
-    根据查询文本语义检索相关岗位。
+    """根据岗位、技能、城市或行业查询，返回结构化岗位证据。
 
-    Args:
-        query: 查询文本，如"数据分析师 SQL Python"或"硕士 AI 算法北京"
-        city: 城市过滤，如"北京"、"上海"（可选）
-        industry: 行业过滤，如"银行"、"科技"（可选）
-        top_k: 返回结果数量，默认 5
+    参数：
+        query: 自然语言检索词，例如岗位名、技能组合或求职方向。
+        city: 可选，按城市过滤岗位。
+        industry: 可选，按行业过滤岗位。
+        top_k: 最多返回多少条代表性岗位。
 
-    Returns:
-        匹配岗位列表，每条包含岗位名、公司、城市、薪资、JD 摘要、相似度得分
+    返回：
+        统一格式的结果字典，包含：
+        - tool：稳定的工具名
+        - summary：给调用方看的简短检索说明
+        - data：代表性岗位列表
+        - meta：底层检索服务返回的元信息
     """
     result = await search_jobs_service_with_meta(
         query=query,

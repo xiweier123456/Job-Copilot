@@ -11,10 +11,10 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def _get_model():
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer(settings.reranker_model)  # 使用本地路径
+    from sentence_transformers import CrossEncoder
+
     logger.info("Loading reranker model from local path: %s", settings.reranker_model)
-    return model
+    return CrossEncoder(settings.reranker_model)
 
 
 def rerank_hits(
@@ -27,7 +27,7 @@ def rerank_hits(
         return []
 
     annotated = [dict(hit) for hit in hits]
-    #深拷贝
+    # 深拷贝
     for index, hit in enumerate(annotated, start=1):
         hit.setdefault("rerank_score", None)
         hit["final_rank"] = index
@@ -37,7 +37,7 @@ def rerank_hits(
 
     try:
         model = _get_model()
-        #将用户的 query 和每个结果的 text 组合成对（Pairs），这是交叉编码器（Cross-Encoder）重排模型的标准输入格式
+        # 将用户 query 和每个候选文本组成句对，这是 CrossEncoder 重排模型的标准输入。
         pairs = [(query, str(hit.get("text") or "")) for hit in annotated]
         scores = model.predict(pairs)
     except Exception as exc:
@@ -52,9 +52,9 @@ def rerank_hits(
 
     rescored.sort(
         key=lambda item: (
-            item.get("rerank_score") is not None,#先按照 rerank_score 是否存在排序，存在的排在前面
-            item.get("rerank_score") or float("-inf"),#再按照 rerank_score 的值排序，分数高的排在前面；如果 rerank_score 不存在，则视为负无穷，排在最后
-            item.get("score") or float("-inf"),#最后按照原始的向量检索分数排序，分数高的排在前面；如果 score 不存在，则视为负无穷，排在最后
+            item.get("rerank_score") is not None,  # 先按是否成功得到 rerank 分数排序
+            item.get("rerank_score") or float("-inf"),  # 再按 rerank 分数从高到低排序
+            item.get("score") or float("-inf"),  # 最后用原始向量分数作为兜底排序
         ),
         reverse=True,
     )

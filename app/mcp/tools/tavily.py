@@ -1,6 +1,9 @@
 """
 app/mcp/tools/tavily.py
-MCP tools：Tavily 联网搜索 / 研究 / 抽取
+
+面向 MCP 层的 Tavily 工具封装。
+这些函数会把 Tavily 返回结果整理成统一结构，便于 MCP client 和上层
+agent 工具直接消费。
 """
 from __future__ import annotations
 
@@ -16,11 +19,21 @@ from app.services.tavily_client import (
 
 
 def _split_csv(value: str) -> list[str] | None:
+    """把逗号分隔的字符串转成清洗后的列表。
+
+    当输入清洗后为空时返回 ``None``，方便下游 Tavily client 区分
+    “没有传这个参数”和“传了一个空列表”。
+    """
     items = [item.strip() for item in value.split(",") if item.strip()]
     return items or None
 
 
 def _build_search_items(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """把 Tavily 原始搜索结果整理成紧凑的预览项。
+
+    每条结果保留标题、链接、分数和截断摘要，既方便引用证据，也避免
+    一次性把过长正文塞进模型上下文。
+    """
     output = []
     for item in items[:limit]:
         content = (item.get("content") or "").strip()
@@ -43,6 +56,11 @@ async def tavily_search(
     topic: str = "general",
     time_range: str = "",
 ) -> dict:
+    """执行 Tavily 常规联网搜索，并返回统一格式的网页证据。
+
+    这个封装主要用于快速获取最新网页信息；即使 Tavily 服务异常，
+    也会返回稳定的错误结构，方便上层统一处理。
+    """
     try:
         result = await _tavily_search(
             query=query,
@@ -77,6 +95,7 @@ async def tavily_research(
     exclude_domains: str = "",
     max_results: int = 5,
 ) -> dict:
+    """执行 Tavily 深度研究模式，适合多来源总结与对比分析。"""
     try:
         result = await _tavily_research(
             query=query,
@@ -117,6 +136,7 @@ async def tavily_research(
 
 
 async def tavily_extract(urls: str) -> dict:
+    """抽取一个或多个网页正文，并返回裁剪后的文本证据。"""
     url_list = [item.strip() for item in urls.replace("\n", ",").split(",") if item.strip()]
     if not url_list:
         return {
@@ -161,6 +181,7 @@ async def batch_tavily_search(
     max_results_per_query: int = 3,
     time_range: str = "",
 ) -> dict:
+    """并发执行多个 Tavily 搜索，适合批量收集相关网页证据。"""
     query_list = [q.strip() for q in queries.split("|||") if q.strip()]
     if not query_list:
         return {
@@ -171,6 +192,7 @@ async def batch_tavily_search(
         }
 
     async def _single_search(query: str) -> dict[str, Any]:
+        """执行批量任务中的单个搜索，并把失败情况也标准化。"""
         try:
             result = await _tavily_search(
                 query=query,

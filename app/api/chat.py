@@ -24,11 +24,24 @@ class ClearChatRequest(BaseModel):
     session_id: str = Field(..., description="需要清空的会话 ID")
 
 
+class ToolCallInfo(BaseModel):
+    name: str = Field(..., description="运行时工具名")
+    agent_name: str = Field(..., description="agent wrapper 名称")
+    display_name: str = Field(..., description="前端展示用中文工具名")
+    description: str = Field(default="", description="工具用途说明")
+    category: str = Field(default="unknown", description="工具分类")
+    requires_network: bool | None = Field(default=None, description="是否需要联网")
+    latency: str | None = Field(default=None, description="预计耗时等级")
+    evidence_type: str | None = Field(default=None, description="输出证据类型")
+    status: str | None = Field(default=None, description="当前工具状态")
+
+
 class ChatResponse(BaseModel):
     reply: str = Field(..., description="Agent 的回复")
     session_id: str = Field(..., description="会话 ID，原样返回")
     used_subagents: list[str] = Field(default_factory=list, description="本轮实际使用的子 Agent")
     tool_calls_summary: list[str] = Field(default_factory=list, description="本轮识别到的工具调用摘要")
+    tool_calls: list[ToolCallInfo] = Field(default_factory=list, description="本轮结构化工具调用信息")
     sources: list[str] = Field(default_factory=list, description="从回复中提取到的参考链接")
     latency_ms: float = Field(..., description="本轮调用耗时，单位毫秒")
     error: str | None = Field(default=None, description="错误信息；成功时为 null")
@@ -52,7 +65,6 @@ def _utc_timestamp() -> str:
 
 
 def _build_turn_record(request: ChatRequest, result: dict, status: str) -> dict:
-    
     reply = str(result.get("reply") or "").strip()
     error = result.get("error")
     latest_status = "回答已生成"
@@ -81,6 +93,7 @@ def _build_turn_record(request: ChatRequest, result: dict, status: str) -> dict:
             "latency_ms": result.get("latency_ms"),
             "used_subagents": result.get("used_subagents") or [],
             "tool_calls_summary": result.get("tool_calls_summary") or [],
+            "tool_calls": result.get("tool_calls") or [],
             "sources": result.get("sources") or [],
         },
         "activity": {
@@ -88,6 +101,7 @@ def _build_turn_record(request: ChatRequest, result: dict, status: str) -> dict:
             "todos": [],
             "subagents": result.get("used_subagents") or [],
             "tools": result.get("tool_calls_summary") or [],
+            "toolDetails": result.get("tool_calls") or [],
             "errorMessage": error_message,
         },
     }
@@ -156,6 +170,7 @@ async def chat(request: ChatRequest):
             "session_id": request.session_id,
             "used_subagents": [],
             "tool_calls_summary": [],
+            "tool_calls": [],
             "sources": [],
             "latency_ms": 0,
             "error": str(exc),
@@ -199,6 +214,7 @@ async def chat_stream(http_request: Request, request: ChatRequest):
                         "session_id": request.session_id,
                         "used_subagents": [],
                         "tool_calls_summary": [],
+                        "tool_calls": [],
                         "sources": [],
                         "latency_ms": 0,
                         "error": payload.get("message") or "agent 运行失败，请稍后重试。",
@@ -210,6 +226,7 @@ async def chat_stream(http_request: Request, request: ChatRequest):
                         "session_id": request.session_id,
                         "used_subagents": [],
                         "tool_calls_summary": [],
+                        "tool_calls": [],
                         "sources": [],
                         "latency_ms": 0,
                         "error": None,
@@ -225,6 +242,7 @@ async def chat_stream(http_request: Request, request: ChatRequest):
                             "session_id": request.session_id,
                             "used_subagents": [],
                             "tool_calls_summary": [],
+                            "tool_calls": [],
                             "sources": [],
                             "latency_ms": 0,
                             "error": None,
@@ -238,6 +256,7 @@ async def chat_stream(http_request: Request, request: ChatRequest):
                 "session_id": request.session_id,
                 "used_subagents": [],
                 "tool_calls_summary": [],
+                "tool_calls": [],
                 "sources": [],
                 "latency_ms": 0,
                 "error": "agent 运行失败，请稍后重试。",

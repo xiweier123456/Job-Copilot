@@ -1,30 +1,24 @@
 """
 app/mcp/server.py
-FastMCP server 入口。
 
-运行方式（stdio 模式，供 MCP client 连接）：
-  python -m app.mcp.server
-
-或作为独立 HTTP server：
-  python -m app.mcp.server --transport sse --port 8001
+求职 Copilot 的 FastMCP 服务入口。
+这里从统一工具注册表读取 MCP 工具，确保 MCP 暴露层与 agent 工具层保持一致。
 """
-import sys
 import os
+import sys
+
+from fastmcp import FastMCP
+
+from app.config import settings
+from app.mcp.tool_registry import get_mcp_tools
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from fastmcp import FastMCP
-from app.mcp.tools.search_jobs import search_jobs
-from app.mcp.tools.tavily import (
-    batch_tavily_search,
-    tavily_extract,
-    tavily_research,
-    tavily_search,
-)
-from app.config import settings
+
 MCP_TRANSPORT = settings.mcp_transport
 MCP_HOST = settings.mcp_host
 MCP_PORT = settings.mcp_port
 MCP_PATH = settings.mcp_path
+
 mcp = FastMCP(
     name="job-copilot",
     instructions=(
@@ -33,12 +27,8 @@ mcp = FastMCP(
     ),
 )
 
-# 注册所有 tools
-mcp.tool()(search_jobs)
-mcp.tool()(tavily_search)
-mcp.tool()(tavily_research)
-mcp.tool()(tavily_extract)
-mcp.tool()(batch_tavily_search)
+for mcp_tool in get_mcp_tools():
+    mcp.tool()(mcp_tool)
 
 if __name__ == "__main__":
     mcp.run(

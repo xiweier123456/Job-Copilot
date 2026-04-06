@@ -22,6 +22,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, AsyncIterator
 
+import httpx
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, StoreBackend
 from deepagents.backends.filesystem import FilesystemBackend
@@ -38,12 +39,10 @@ from app.prompts.agent_prompts import (
     build_resume_agent_prompt,
 )
 from app.services.chat_history_service import build_history_context
-from app.agents.tools import (
-    search_jobs_tool,
-    tavily_search_tool,
-    tavily_research_tool,
-    tavily_extract_tool,
-    batch_tavily_search_tool,
+from app.mcp.tool_registry import (
+    get_subagent_tools,
+    get_tool_spec_by_agent_name,
+    serialize_tool_spec,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,29 +63,35 @@ TRACE_CONTEXT_TOOL_PATTERN = re.compile(r'"tool_call"\s*:\s*\{\s*"name"\s*:\s*"(
 
 
 class AgentRunError(RuntimeError):
-    """Raised when the deep agent run fails."""
+    """当 deep agent 运行失败时抛出的统一异常。"""
 
 
 @dataclass
-class ActiveRun:#表示一个正在运行的 agent 实例，包含 run_id、session_id 和一个 asyncio.Event 用于取消运行
+class ActiveRun:
+    """记录一个正在运行的 agent 实例，并暴露取消信号。"""
+
     run_id: str
     session_id: str
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
-_ACTIVE_RUNS: dict[str, ActiveRun] = {}#全局字典，存储所有正在运行的 agent 实例，key 是 run_id，value 是 ActiveRun 对象
+_ACTIVE_RUNS: dict[str, ActiveRun] = {}
 
 
-def create_run(session_id: str) -> ActiveRun:#创建一个新的 agent 运行实例，生成唯一 run_id，并将其与 session_id 关联，存储在全局 _ACTIVE_RUNS 中
+def create_run(session_id: str) -> ActiveRun:
+    """为指定 session 创建并登记一个新的运行实例。"""
     run = ActiveRun(run_id=uuid.uuid4().hex, session_id=session_id)
     _ACTIVE_RUNS[run.run_id] = run
     return run
 
-def get_run(run_id: str) -> ActiveRun | None:#根据 run_id 获取当前运行的 agent 实例，查看是否正在运行
+
+def get_run(run_id: str) -> ActiveRun | None:
+    """根据 run_id 读取仍在跟踪中的运行实例。"""
     return _ACTIVE_RUNS.get(run_id)
 
 
-def cancel_run(run_id: str) -> bool:#将当前运行的 agent 标记为取消，返回是否成功找到并标记
+def cancel_run(run_id: str) -> bool:
+    """标记某个运行实例为已取消，并返回它是否存在。"""
     run = get_run(run_id)
     if run is None:
         return False
@@ -94,7 +99,8 @@ def cancel_run(run_id: str) -> bool:#将当前运行的 agent 标记为取消，
     return True
 
 
-def remove_run(run_id: str) -> None:#从全局 _ACTIVE_RUNS 中移除一个运行实例，通常在运行结束后调用
+def remove_run(run_id: str) -> None:
+    """从内存中的活动运行表里移除一个运行实例。"""
     _ACTIVE_RUNS.pop(run_id, None)
 
 
@@ -134,22 +140,25 @@ def _build_model():
 
 @lru_cache(maxsize=1)
 def get_checkpointer():
+    """返回共享的 LangGraph checkpointer，用于保存线程级记忆。"""
     return MemorySaver()
 
 
 @lru_cache(maxsize=1)
 def get_store():
+    """返回 deep agent 运行时共用的内存存储。"""
     return InMemoryStore()
 
 
 @lru_cache(maxsize=1)
 def get_agent():
-    """单例创建 deep agent，避免每次请求重复初始化。"""
+    """创建单例 deep agent，并给每个 subagent 绑定对应工具集。"""
     model = _build_model()
     checkpointer = get_checkpointer()
     store = get_store()
 
     def _make_backend(runtime):
+        """把仓库文件访问路由到文件系统，把记忆目录路由到 StoreBackend。"""
         return CompositeBackend(
             default=FilesystemBackend(root_dir=str(PROJECT_ROOT)),
             routes={
@@ -176,11 +185,11 @@ def get_agent():
                 "\"某岗位通常要求什么\"、\"某城市有哪些相关岗位\"等问题。"
             ),
             "system_prompt": build_job_search_agent_prompt(),
-            "tools": [search_jobs_tool, tavily_search_tool, tavily_research_tool, tavily_extract_tool, batch_tavily_search_tool],
+            "tools": get_subagent_tools("job-search-agent"),
             "skills": [
                 "skills/tavily/tavily-search",
                 "skills/tavily/tavily-research",
-            ], 
+            ],
         },
         {
             "name": "resume-agent",
@@ -189,7 +198,7 @@ def get_agent():
                 "适用于用户贴出简历、询问\"我的简历适合什么岗位\"或\"和某岗位匹不匹配\"等场景。"
             ),
             "system_prompt": build_resume_agent_prompt(),
-            "tools": [search_jobs_tool, tavily_search_tool, tavily_research_tool, tavily_extract_tool, batch_tavily_search_tool],
+            "tools": get_subagent_tools("resume-agent"),
             "skills": [
                 "skills/tavily/tavily-search",
                 "skills/tavily/tavily-research",
@@ -203,7 +212,7 @@ def get_agent():
                 "\"下一步怎么准备\"等问题。"
             ),
             "system_prompt": build_career_agent_prompt(),
-            "tools": [search_jobs_tool, tavily_search_tool, tavily_research_tool, batch_tavily_search_tool],
+            "tools": get_subagent_tools("career-agent"),
             "skills": [
                 "skills/tavily/tavily-search",
                 "skills/tavily/tavily-research",
@@ -216,7 +225,7 @@ def get_agent():
                 "适用于\"这个岗位面试怎么准备\"、\"常见面试题有哪些\"、\"面经重点是什么\"等问题。"
             ),
             "system_prompt": build_interview_agent_prompt(),
-            "tools": [search_jobs_tool, tavily_search_tool, tavily_research_tool, tavily_extract_tool, batch_tavily_search_tool],
+            "tools": get_subagent_tools("interview-agent"),
             "skills": [
                 "skills/tavily/tavily-search",
                 "skills/tavily/tavily-research",
@@ -271,11 +280,13 @@ def _extract_text_from_message_content(content) -> str:
 
 
 def _extract_message_role(message: Any) -> str:
+    """从 LangChain 风格的消息对象中提取角色字段。"""
     role = getattr(message, "type", None) or getattr(message, "role", None)
     return role if isinstance(role, str) else ""
 
 
 def _extract_message_name(message: Any) -> str:
+    """提取消息上的 name 字段，用来识别 subagent 或工具名。"""
     name = getattr(message, "name", None)
     if isinstance(name, str) and name.strip():
         return name.strip()
@@ -290,6 +301,7 @@ def _extract_message_name(message: Any) -> str:
 
 
 def _collect_sources(text: str) -> list[str]:
+    """从回复文本中提取以“链接：”开头的唯一来源地址。"""
     sources: list[str] = []
     for line in text.splitlines():
         line = line.strip()
@@ -301,6 +313,7 @@ def _collect_sources(text: str) -> list[str]:
 
 
 def _collect_used_subagents(messages: list[Any], event_texts: list[str] | None = None) -> list[str]:
+    """从消息元信息和事件轨迹中推断本轮实际使用过的 subagent。"""
     used: list[str] = []
     for message in messages:
         name = _extract_message_name(message)
@@ -319,6 +332,7 @@ def _collect_used_subagents(messages: list[Any], event_texts: list[str] | None =
 
 
 def _collect_tool_calls_summary(messages: list[Any], event_texts: list[str] | None = None) -> list[str]:
+    """汇总消息与事件轨迹里出现过的工具 wrapper 名称。"""
     summaries: list[str] = []
     seen: set[str] = set()
 
@@ -345,7 +359,32 @@ def _collect_tool_calls_summary(messages: list[Any], event_texts: list[str] | No
     return summaries
 
 
+def _build_tool_call_details(tool_names: list[str]) -> list[dict[str, Any]]:
+    """把工具名列表映射成适合前端展示的结构化工具信息。"""
+    details: list[dict[str, Any]] = []
+    for tool_name in tool_names:
+        spec = get_tool_spec_by_agent_name(tool_name)
+        if spec is None:
+            details.append(
+                {
+                    "name": tool_name,
+                    "agent_name": tool_name,
+                    "display_name": tool_name,
+                    "description": "",
+                    "category": "unknown",
+                    "requires_network": None,
+                    "latency": None,
+                    "evidence_type": None,
+                    "status": "completed",
+                }
+            )
+            continue
+        details.append(serialize_tool_spec(spec, name=tool_name, status="completed"))
+    return details
+
+
 def _extract_reply(result: dict[str, Any]) -> str:
+    """从 deep agent 的结果结构中尽量提取最终回复文本。"""
     messages = result.get("messages", [])
     for msg in reversed(messages):
         content = getattr(msg, "content", None)
@@ -371,10 +410,12 @@ def _extract_reply(result: dict[str, Any]) -> str:
 
 
 def _utc_timestamp() -> str:
+    """返回当前 UTC 时间的 ISO-8601 时间戳。"""
     return datetime.now(timezone.utc).isoformat()
 
 
 def _extract_todo_items(text: str) -> list[dict[str, str]]:
+    """从原始事件文本中提取 TodoWrite 风格的任务项，用于 SSE 进度展示。"""
     items: list[dict[str, str]] = []
 
     for status in ("in_progress", "pending", "completed"):
@@ -396,6 +437,7 @@ def _build_stream_event(
     sequence: int,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
+    """构造一条发给 API 层的标准化 SSE 事件。"""
     return {
         "type": event_type,
         "session_id": session_id,
@@ -407,8 +449,7 @@ def _build_stream_event(
 
 
 def _build_runtime_message(message: str, history_context: str) -> str:
-    # thread_id=session_id 负责正常连续对话的主路径。
-    # transcript 只在“当前进程内没有可用线程记忆”时作为恢复兜底，避免每轮都把同一份历史重复注入。
+    """在需要时把兜底历史上下文拼进当前用户消息。"""
     if not history_context:
         return message
     return f"{history_context}\n\n{message}".strip()
@@ -422,6 +463,7 @@ def _normalize_event(
     seen_subagents: set[str],
     seen_todos: set[str],
 ) -> dict[str, Any] | None:
+    """把 deep agent 原始事件转换成前端可消费的稳定流式事件。"""
     event_name = event.get("event")
     name = event.get("name")
     event_text = json.dumps(event, ensure_ascii=False, default=str)
@@ -449,21 +491,29 @@ def _normalize_event(
         )
 
     if event_name == "on_tool_start" and isinstance(name, str) and name != "task":
+        spec = get_tool_spec_by_agent_name(name)
+        payload = {"name": name, "status": "started"}
+        if spec is not None:
+            payload = serialize_tool_spec(spec, name=name, status="started")
         return _build_stream_event(
             "tool",
             session_id,
             run_id,
             sequence,
-            {"name": name, "status": "started"},
+            payload,
         )
 
     if event_name == "on_tool_end" and isinstance(name, str) and name != "task":
+        spec = get_tool_spec_by_agent_name(name)
+        payload = {"name": name, "status": "completed"}
+        if spec is not None:
+            payload = serialize_tool_spec(spec, name=name, status="completed")
         return _build_stream_event(
             "tool",
             session_id,
             run_id,
             sequence,
-            {"name": name, "status": "completed"},
+            payload,
         )
 
     for subagent_name in SUBAGENT_NAMES:
@@ -481,10 +531,12 @@ def _normalize_event(
 
 
 def _build_final_response(result: dict[str, Any], session_id: str, event_texts: list[str], start: float) -> dict[str, Any]:
+    """根据原始 agent 结果和事件轨迹组装最终 API 返回结构。"""
     messages = result.get("messages", [])
     reply = _extract_reply(result)
     used_subagents = _collect_used_subagents(messages, event_texts)
     tool_calls_summary = _collect_tool_calls_summary(messages, event_texts)
+    tool_calls = _build_tool_call_details(tool_calls_summary)
     sources = _collect_sources(reply)
     latency_ms = round((perf_counter() - start) * 1000, 2)
 
@@ -501,6 +553,7 @@ def _build_final_response(result: dict[str, Any], session_id: str, event_texts: 
         "session_id": session_id,
         "used_subagents": used_subagents,
         "tool_calls_summary": tool_calls_summary,
+        "tool_calls": tool_calls,
         "sources": sources,
         "latency_ms": latency_ms,
         "error": None,
@@ -512,6 +565,7 @@ async def stream_agent_events(
     session_id: str = "default",
     run_id: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
+    """流式产出标准化运行事件，供 API 层转发为 SSE。"""
     agent = get_agent()
     start = perf_counter()
     final_result: dict[str, Any] | None = None
@@ -576,6 +630,16 @@ async def stream_agent_events(
             {"reason": "client_disconnected", "message": "生成已停止"},
         )
         return
+    except httpx.RemoteProtocolError as exc:
+        logger.warning("Upstream model stream closed early for session %s: %s", session_id, exc)
+        yield _build_stream_event(
+            "error",
+            session_id,
+            current_run_id,
+            sequence,
+            {"message": "上游模型流式连接中断，请稍后重试。"},
+        )
+        raise AgentRunError("上游模型流式连接中断，请稍后重试。") from exc
     except Exception as exc:
         logger.exception("Agent run failed for session %s", session_id)
         yield _build_stream_event(
