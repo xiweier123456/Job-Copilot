@@ -1,9 +1,42 @@
 from pathlib import Path
+from typing import Any, Literal
 
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 MODEL_ROOT = Path("E:/Study/model")
+
+
+class ExternalMCPServiceConfig(BaseModel):
+    """描述一个外部 MCP 服务的接入配置。"""
+
+    name: str
+    enabled: bool = True
+    transport: Literal["streamable-http", "http", "sse", "stdio"] = "streamable-http"
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, Any] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    cwd: str | None = None
+    timeout: int | None = None
+    keep_alive: bool | None = None
+    priority: int = 0
+    prefix: str | None = None
+    include_tools: list[str] = Field(default_factory=list)
+    exclude_tools: list[str] = Field(default_factory=list)
+    description: str | None = None
+
+    @model_validator(mode="after")
+    def validate_endpoint(self):
+        """根据 transport 校验远端地址或本地命令是否完整。"""
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError("stdio 外部 MCP 服务必须提供 command")
+        elif not self.url:
+            raise ValueError("远程外部 MCP 服务必须提供 url")
+        return self
 
 
 class Settings(BaseSettings):
@@ -56,8 +89,7 @@ class Settings(BaseSettings):
     mcp_debug: bool = False
     mcp_tool_name_prefix: bool = False
     mcp_transport: str = "streamable-http"
-
-    # 应用
+    external_mcp_services: list[ExternalMCPServiceConfig] = ""
     app_title: str = "Job Copilot"
     app_version: str = "0.1.0"
     debug: bool = False

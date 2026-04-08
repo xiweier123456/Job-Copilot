@@ -25,8 +25,9 @@ Job Copilot combines RAG (Retrieval-Augmented Generation) with a multi-agent arc
 | Interview Prep | Role-specific questions, answer frameworks, and preparation checklists |
 | Live Web Augmentation | Real-time search via Tavily API for current market signals, company pages, interview experiences, and community posts |
 | Multi-Agent Orchestration | A main Deep Agent delegates to 4 specialized subagents: job search, resume, career, interview |
-| Unified Tool Registry | `app/mcp/tool_registry.py` is the single source of truth for MCP tools, agent wrappers, subagent tool groups, and display metadata |
-| Structured Tool Metadata | Chat responses and SSE events expose tool `display_name`, `description`, `category`, `requires_network`, `latency`, and `evidence_type` |
+| Unified Tool Registry | `app/mcp/tool_registry.py` is the single source of truth for local tools, external MCP tools, agent wrappers, subagent tool groups, and display metadata |
+| External MCP Service Management | `app/mcp/external_service_registry.py` loads external MCP services from config, discovers tools, applies include/exclude/prefix rules, and merges them into the final tool pool |
+| Structured Tool Metadata | Chat responses and SSE events expose tool `display_name`, `description`, `category`, `requires_network`, `latency`, `evidence_type`, `source_type`, and `source_name` |
 | Session Memory + History | Each chat turn is persisted with context, status, tool activity, and structured metadata for history replay |
 | Split Model Strategy | DeepSeek handles RAG/service-side reasoning, while the deep-agent framework runs on Minimax |
 
@@ -54,7 +55,7 @@ Job Copilot combines RAG (Retrieval-Augmented Generation) with a multi-agent arc
                                        ▼
                          ┌──────────────────────────────┐
                          │ Unified Tool Registry        │
-                         │ search_jobs / Tavily tools   │
+                         │ local tools + external MCP   │
                          │ + metadata serialization     │
                          └──────────────┬───────────────┘
                                         ▼
@@ -163,13 +164,43 @@ uvicorn app.main:app --reload --port 8001
 
 API docs: **http://localhost:8001/docs**
 
-### 5. Start the MCP Server (Optional)
+### External MCP Services
 
-```bash
-python -m app.mcp.server
+You can attach external MCP services through config and let the registry merge them with local tools.
+
+Example settings shape:
+
+```python
+external_mcp_services = [
+    {
+        "name": "remote-search",
+        "enabled": True,
+        "transport": "streamable-http",
+        "url": "http://127.0.0.1:9000/mcp",
+        "priority": 10,
+        "prefix": "remote_",
+        "include_tools": [],
+        "exclude_tools": [],
+    },
+    {
+        "name": "local-stdio",
+        "enabled": False,
+        "transport": "stdio",
+        "command": "python",
+        "args": ["-m", "some_package.mcp_server"],
+        "timeout": 30,
+    },
+]
 ```
 
-## API Reference
+Behavior rules in the current implementation:
+
+- local tools win over external tools on name collision
+- external tools are discovered from all enabled services
+- `include_tools` / `exclude_tools` are applied per service
+- `prefix` can rename exposed tool names before they enter the final pool
+- discovered external tools are exposed to FastMCP and agent tool selection through the same registry API
+
 
 ### Health Check
 
@@ -185,6 +216,8 @@ GET /jobs/search?query=数据分析师&city=北京&top_k=5
 
 ### Resume Matching
 
+Text mode:
+
 ```http
 POST /resume/match
 Content-Type: application/json
@@ -196,10 +229,24 @@ Content-Type: application/json
 }
 ```
 
+PDF upload mode:
+
+```bash
+curl -X POST "http://localhost:8001/resume/match/upload" \
+  -F "resume_file=@resume.pdf" \
+  -F "job_query=数据分析师" \
+  -F "city=北京" \
+  -F "top_k=3"
+```
+
+> PDF upload currently supports text-based PDFs only. Scanned/image PDFs may fail to extract readable text.
+
 ### Conversational Agent
 
+Streaming text mode:
+
 ```http
-POST /chat
+POST /chat/stream
 Content-Type: application/json
 
 {
@@ -212,14 +259,20 @@ Content-Type: application/json
 }
 ```
 
-**Returns:** reply text, used subagents, tool call summaries, structured `tool_calls`, source URLs, latency, and error info.
+Streaming PDF upload mode:
+
+```bash
+curl -N -X POST "http://localhost:8001/chat/stream/upload" \
+  -F "resume_file=@resume.pdf" \
+  -F "message=帮我根据简历分析适合的岗位并给出建议" \
+  -F "session_id=user_001" \
+  -F "target_city=北京" \
+  -F "job_direction=数据分析"
+```
+
+> Chat currently keeps only the streaming endpoints. PDF upload uses multipart/form-data, while text mode keeps JSON `ChatRequest`.
 
 ### Streaming Chat
-
-```http
-POST /chat/stream
-Content-Type: application/json
-```
 
 SSE event types include:
 
@@ -243,6 +296,8 @@ SSE event types include:
   "requires_network": false,
   "latency": "medium",
   "evidence_type": "job_postings",
+  "source_type": "local",
+  "source_name": "local",
   "status": "started"
 }
 ```

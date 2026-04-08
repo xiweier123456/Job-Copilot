@@ -160,7 +160,7 @@ def get_agent():
     def _make_backend(runtime):
         """把仓库文件访问路由到文件系统，把记忆目录路由到 StoreBackend。"""
         return CompositeBackend(
-            default=FilesystemBackend(root_dir=str(PROJECT_ROOT)),
+            default=FilesystemBackend(root_dir=str(PROJECT_ROOT),virtual_mode=True),
             routes={
                 str(MEMORY_ROOT): StoreBackend(runtime),
             },
@@ -238,7 +238,10 @@ def get_agent():
         system_prompt=SYSTEM_PROMPT,
         tools=[],
         subagents=subagents,
-        skills=["skills/tavily"],
+        skills=[
+            "skills/tavily/tavily-search",
+            "skills/tavily/tavily-research",
+        ],
         name="job-copilot-agent",
         checkpointer=checkpointer,
         store=store,

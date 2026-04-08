@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
@@ -148,47 +148,23 @@ def _build_agent_message(request: ChatRequest) -> str:
 def _format_sse(event: dict) -> str:
     event_type = event.get("type", "message")
     data = json.dumps(event, ensure_ascii=False)
-    # print(f"SSE event: {event_type}, data: {data}\n")
     return f"event: {event_type}\ndata: {data}\n\n"
 
 
-@router.post("", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """
-    求职问答对话（deepagents / create_deep_agent）。
-    Agent 会自主委派 subagent，并通过岗位检索、简历分析、职业路径、面试准备等工具完成回答。
-    """
-    from app.agents.graph import AgentRunError, run_agent
-    from app.rag.chat_memory_store import save_chat_memory
-    from app.services.chat_history_service import save_chat_turn
-
-    try:
-        result = await run_agent(_build_agent_message(request), request.session_id)
-    except AgentRunError as exc:
-        result = {
-            "reply": "抱歉，这次对话暂时失败了，请稍后重试。",
-            "session_id": request.session_id,
-            "used_subagents": [],
-            "tool_calls_summary": [],
-            "tool_calls": [],
-            "sources": [],
-            "latency_ms": 0,
-            "error": str(exc),
-        }
-        # transcript 在终态后再保存，这样历史里拿到的是完整的一轮结果，而不是半成品。
-        turn = _build_turn_record(request, result, status="error")
-        await save_chat_turn(turn)
-        await save_chat_memory(turn)
-        return ChatResponse(**result)
-
-    turn = _build_turn_record(request, result, status="done")
-    await save_chat_turn(turn)
-    await save_chat_memory(turn)
-    return ChatResponse(**result)
+def _empty_chat_result(session_id: str, error: str | None = None) -> dict:
+    return {
+        "reply": "",
+        "session_id": session_id,
+        "used_subagents": [],
+        "tool_calls_summary": [],
+        "tool_calls": [],
+        "sources": [],
+        "latency_ms": 0,
+        "error": error,
+    }
 
 
-@router.post("/stream")
-async def chat_stream(http_request: Request, request: ChatRequest):
+async def _stream_chat_request(http_request: Request, request: ChatRequest) -> StreamingResponse:
     from app.agents.graph import AgentRunError, cancel_run, create_run, stream_agent_events
     from app.rag.chat_memory_store import save_chat_memory
     from app.services.chat_history_service import save_chat_turn
@@ -209,62 +185,28 @@ async def chat_stream(http_request: Request, request: ChatRequest):
                     final_payload = payload
                     final_status = "error" if payload.get("error") else "done"
                 elif event_type == "error":
-                    final_payload = {
-                        "reply": "",
-                        "session_id": request.session_id,
-                        "used_subagents": [],
-                        "tool_calls_summary": [],
-                        "tool_calls": [],
-                        "sources": [],
-                        "latency_ms": 0,
-                        "error": payload.get("message") or "agent 运行失败，请稍后重试。",
-                    }
+                    final_payload = _empty_chat_result(
+                        request.session_id,
+                        error=payload.get("message") or "agent 运行失败，请稍后重试。",
+                    )
                     final_status = "error"
                 elif event_type == "stopped":
-                    final_payload = {
-                        "reply": "",
-                        "session_id": request.session_id,
-                        "used_subagents": [],
-                        "tool_calls_summary": [],
-                        "tool_calls": [],
-                        "sources": [],
-                        "latency_ms": 0,
-                        "error": None,
-                    }
+                    final_payload = _empty_chat_result(request.session_id)
                     final_status = "stopped"
 
                 if await http_request.is_disconnected():
                     cancel_run(run.run_id)
                     final_status = "stopped"
                     if final_payload is None:
-                        final_payload = {
-                            "reply": "",
-                            "session_id": request.session_id,
-                            "used_subagents": [],
-                            "tool_calls_summary": [],
-                            "tool_calls": [],
-                            "sources": [],
-                            "latency_ms": 0,
-                            "error": None,
-                        }
+                        final_payload = _empty_chat_result(request.session_id)
                     break
 
                 yield _format_sse(event)
         except AgentRunError:
-            final_payload = {
-                "reply": "",
-                "session_id": request.session_id,
-                "used_subagents": [],
-                "tool_calls_summary": [],
-                "tool_calls": [],
-                "sources": [],
-                "latency_ms": 0,
-                "error": "agent 运行失败，请稍后重试。",
-            }
+            final_payload = _empty_chat_result(request.session_id, error="agent 运行失败，请稍后重试。")
             final_status = "error"
         finally:
             if final_payload is not None:
-                # stopped 也要落盘，这样用户中断生成后，后续回到同一 session 仍能看到这轮上下文。
                 turn = _build_turn_record(request, final_payload, status=final_status)
                 await save_chat_turn(turn)
                 await save_chat_memory(turn)
@@ -278,6 +220,54 @@ async def chat_stream(http_request: Request, request: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+async def _build_chat_request_from_upload(
+    *,
+    resume_file: UploadFile,
+    message: str,
+    session_id: str = "default",
+    user_profile: str = "",
+    target_city: str = "",
+    job_direction: str = "",
+) -> ChatRequest:
+    from app.services.document_service import extract_text_from_pdf_upload
+
+    resume_text = await extract_text_from_pdf_upload(resume_file)
+    return ChatRequest(
+        message=message,
+        session_id=session_id,
+        user_profile=user_profile or None,
+        target_city=target_city or None,
+        job_direction=job_direction or None,
+        resume_text=resume_text,
+    )
+
+
+@router.post("/stream")
+async def chat_stream(http_request: Request, request: ChatRequest):
+    return await _stream_chat_request(http_request, request)
+
+
+@router.post("/stream/upload")
+async def chat_stream_upload(
+    http_request: Request,
+    resume_file: UploadFile = File(..., description="上传的 PDF 简历"),
+    message: str = Form(..., description="用户输入的消息"),
+    session_id: str = Form(default="default", description="会话 ID"),
+    user_profile: str = Form(default="", description="用户背景信息，可选"),
+    target_city: str = Form(default="", description="目标城市，可选"),
+    job_direction: str = Form(default="", description="目标岗位方向，可选"),
+):
+    request = await _build_chat_request_from_upload(
+        resume_file=resume_file,
+        message=message,
+        session_id=session_id,
+        user_profile=user_profile,
+        target_city=target_city,
+        job_direction=job_direction,
+    )
+    return await _stream_chat_request(http_request, request)
 
 
 @router.get("/history", response_model=ChatHistoryResponse)

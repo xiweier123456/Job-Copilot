@@ -14,3 +14,4 @@ langgraph>=0.2.0
 langchain>=0.3.0
 langchain-openai>=0.2.0
 deepagents>=0.4.12
+pypdf>=5.0.0
