@@ -5,6 +5,44 @@ from __future__ import annotations
 from app.prompts.helpers import join_sections
 
 
+CONTEXT_COMPRESSION_SYSTEM_PROMPT = """
+你是对话上下文压缩器。你的任务是把历史对话和长期记忆压缩成紧凑但可用的上下文，供求职 Agent 继续回答当前问题。
+
+要求：
+- 只保留会影响当前回答的事实、用户偏好、简历背景、目标城市、目标岗位、已给过的重要建议、工具证据和待办结论。
+- 删除寒暄、重复表达、无关网页噪声、失败尝试和冗余格式。
+- 不要改写当前用户问题；当前用户问题会由调用方原样拼接。
+- 输出中文。
+- 只返回 JSON，不要 markdown，不要解释。
+
+JSON 格式：
+{
+  "compressed_context": "压缩后的上下文",
+  "kept_facts": ["保留下来的关键事实"]
+}
+""".strip()
+
+
+def build_context_compression_messages(
+    *,
+    current_message: str,
+    supplemental_context: str,
+    target_tokens: int,
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": CONTEXT_COMPRESSION_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": join_sections(
+                "请压缩下面的补充上下文。",
+                f"目标 token 数约为：{target_tokens}",
+                f"【当前用户问题，仅用于判断相关性，不要改写】\n{current_message}",
+                f"【待压缩补充上下文】\n{supplemental_context}",
+            ),
+        },
+    ]
+
+
 RESUME_MATCH_SYSTEM_PROMPT = """\
 你是一名专业的求职顾问，擅长分析简历与岗位要求的匹配度。
 请根据用户提供的简历内容和参考岗位 JD，给出客观、具体、可操作的分析。
@@ -83,4 +121,3 @@ def build_interview_answer_messages(message: str, hits: list[dict]) -> list[dict
         {"role": "system", "content": INTERVIEW_SYSTEM_PROMPT},
         {"role": "user", "content": build_interview_answer_user_prompt(message=message, hits=hits)},
     ]
-

@@ -78,6 +78,31 @@ class Settings(BaseSettings):
     agent_llm_base_url: str = "https://api.minimaxi.com/v1"
     agent_llm_model: str = "MiniMax-M2.7"
 
+    # Memory
+    memory_enabled: bool = True
+    memory_recall_top_k: int = 3
+    memory_recall_score_threshold: float | None = None
+    memory_recent_history_limit: int = 4
+    memory_prompt_char_budget: int = 1200
+    mem0_collection_name: str = "mem0_chat_memory"
+    mem0_llm_provider: str = "deepseek"
+    mem0_llm_model: str = ""
+    mem0_embedder_provider: str = "huggingface"
+    mem0_embedder_model: str = ""
+    mem0_embedder_dims: int | None = None
+    mem0_history_db_path: str = "outputs/mem0/history.db"
+
+    # Context compression
+    context_compression_enabled: bool = True
+    context_compression_trigger_tokens: int = 6000
+    context_compression_target_tokens: int = 2500
+    context_compression_max_input_chars: int = 16000
+    context_compression_fallback_recent_chars: int = 6000
+
+    # LangGraph checkpoint
+    checkpoint_backend: Literal["memory", "sqlite"] = "sqlite"
+    checkpoint_sqlite_path: str = "outputs/checkpoints/langgraph.db"
+
     # Search
     tavily_api_key: str = ""
 
@@ -89,7 +114,9 @@ class Settings(BaseSettings):
     mcp_debug: bool = False
     mcp_tool_name_prefix: bool = False
     mcp_transport: str = "streamable-http"
-    external_mcp_services: list[ExternalMCPServiceConfig] = ""
+    mcp_external_discovery_ttl_seconds: int = 60
+    mcp_external_discovery_failure_ttl_seconds: int = 30
+    external_mcp_services: list[ExternalMCPServiceConfig] = Field(default_factory=list)
     app_title: str = "Job Copilot"
     app_version: str = "0.1.0"
     debug: bool = False

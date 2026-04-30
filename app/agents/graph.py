@@ -11,6 +11,8 @@ app/agents/graph.py
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import importlib
 import json
 import logging
 import re
@@ -20,6 +22,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
+from threading import Lock
 from typing import Any, AsyncIterator
 
 import httpx
@@ -38,7 +41,10 @@ from app.prompts.agent_prompts import (
     build_main_system_prompt,
     build_resume_agent_prompt,
 )
+from app.prompts.service_prompts import build_context_compression_messages
+from app.services.llm_client import chat_json_completion
 from app.services.chat_history_service import build_history_context
+from app.rag.chat_memory_store import search_chat_memory
 from app.mcp.tool_registry import (
     get_subagent_tools,
     get_tool_spec_by_agent_name,
@@ -56,14 +62,24 @@ SUBAGENT_NAMES = {
     "career-agent",
     "interview-agent",
 }
+CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+LATIN_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]")
 TOOL_NAME_PATTERN = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*_tool)\b")
 TRACE_SUBAGENT_PATTERN = re.compile(r"subagent_type['\"]:\s*['\"]([^'\"]+)['\"]")
 TRACE_TOOL_PATTERN = re.compile(r"tool_calls=\[\{['\"]name['\"]:\s*['\"]([^'\"]+)['\"]")
 TRACE_CONTEXT_TOOL_PATTERN = re.compile(r'"tool_call"\s*:\s*\{\s*"name"\s*:\s*"([^"]+)"')
 
-
 class AgentRunError(RuntimeError):
     """当 deep agent 运行失败时抛出的统一异常。"""
+
+
+class SessionBusyError(RuntimeError):
+    """当同一个 session 已经有运行中的 agent 时抛出。"""
+
+    def __init__(self, session_id: str, run_id: str):
+        self.session_id = session_id
+        self.run_id = run_id
+        super().__init__(f"session {session_id!r} is already running: {run_id}")
 
 
 @dataclass
@@ -75,19 +91,147 @@ class ActiveRun:
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+@dataclass
+class ToolLedgerEntry:
+    """记录一次真实工具调用的生命周期。"""
+
+    event_id: str
+    name: str
+    args_hash: str
+    status: str = "started"
+    started_at: float = field(default_factory=perf_counter)
+    ended_at: float | None = None
+    latency_ms: float | None = None
+    error: str | None = None
+
+
+class RunLedger:
+    """一轮 agent 运行的结构化流水账，用于替代事后正则猜测工具调用。"""
+
+    def __init__(self) -> None:
+        self.tool_entries: list[ToolLedgerEntry] = []
+        self._active_tools: dict[str, ToolLedgerEntry] = {}
+
+    @staticmethod
+    def _event_id(event: dict[str, Any], name: str) -> str:
+        value = event.get("run_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return f"{name}:{id(event)}"
+
+    @staticmethod
+    def _args_hash(event: dict[str, Any]) -> str:
+        data = event.get("data") or {}
+        tool_input = data.get("input") if isinstance(data, dict) else None
+        if tool_input is None:
+            return ""
+        encoded = json.dumps(tool_input, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
+    @staticmethod
+    def _error_text(event: dict[str, Any]) -> str:
+        data = event.get("data") or {}
+        if isinstance(data, dict):
+            for key in ("error", "exception"):
+                value = data.get(key)
+                if value:
+                    return str(value)
+        return ""
+
+    def record_tool_start(self, event: dict[str, Any]) -> ToolLedgerEntry | None:
+        name = event.get("name")
+        if not isinstance(name, str) or not name or name == "task":
+            return None
+
+        entry = ToolLedgerEntry(
+            event_id=self._event_id(event, name),
+            name=name,
+            args_hash=self._args_hash(event),
+        )
+        self.tool_entries.append(entry)
+        self._active_tools[entry.event_id] = entry
+        return entry
+
+    def _finish_tool(self, event: dict[str, Any], status: str) -> ToolLedgerEntry | None:
+        name = event.get("name")
+        if not isinstance(name, str) or not name or name == "task":
+            return None
+
+        event_id = self._event_id(event, name)
+        entry = self._active_tools.pop(event_id, None)
+        if entry is None:
+            for active_id, active_entry in reversed(list(self._active_tools.items())):
+                if active_entry.name == name:
+                    entry = self._active_tools.pop(active_id)
+                    break
+        if entry is None:
+            entry = ToolLedgerEntry(
+                event_id=event_id,
+                name=name,
+                args_hash=self._args_hash(event),
+            )
+            self.tool_entries.append(entry)
+
+        entry.status = status
+        entry.ended_at = perf_counter()
+        entry.latency_ms = round((entry.ended_at - entry.started_at) * 1000, 2)
+        if status == "error":
+            entry.error = self._error_text(event) or "tool call failed"
+        return entry
+
+    def record_tool_end(self, event: dict[str, Any]) -> ToolLedgerEntry | None:
+        return self._finish_tool(event, "completed")
+
+    def record_tool_error(self, event: dict[str, Any]) -> ToolLedgerEntry | None:
+        return self._finish_tool(event, "error")
+
+    def tool_names(self) -> list[str]:
+        names: list[str] = []
+        seen: set[str] = set()
+        for entry in self.tool_entries:
+            if entry.name not in seen:
+                seen.add(entry.name)
+                names.append(entry.name)
+        return names
+
+    def tool_details(self) -> list[dict[str, Any]]:
+        return [_build_tool_call_detail(entry) for entry in self.tool_entries]
+
+
 _ACTIVE_RUNS: dict[str, ActiveRun] = {}
+_ACTIVE_SESSION_RUNS: dict[str, str] = {}
+_RUN_REGISTRY_LOCK = Lock()
+_CHECKPOINTER: Any | None = None
+_CHECKPOINTER_CONTEXT: Any | None = None
+_CHECKPOINTER_LOCK = asyncio.Lock()
+_AGENT: Any | None = None
+_AGENT_LOCK = asyncio.Lock()
+
+
+def _normalize_session_id(session_id: str) -> str:
+    """把空 session 统一映射到 default，避免并发注册绕过。"""
+    normalized = (session_id or "default").strip()
+    return normalized or "default"
 
 
 def create_run(session_id: str) -> ActiveRun:
     """为指定 session 创建并登记一个新的运行实例。"""
-    run = ActiveRun(run_id=uuid.uuid4().hex, session_id=session_id)
-    _ACTIVE_RUNS[run.run_id] = run
+    normalized_session_id = _normalize_session_id(session_id)
+    with _RUN_REGISTRY_LOCK:
+        existing_run_id = _ACTIVE_SESSION_RUNS.get(normalized_session_id)
+        if existing_run_id:
+            raise SessionBusyError(normalized_session_id, existing_run_id)
+
+        run = ActiveRun(run_id=uuid.uuid4().hex, session_id=normalized_session_id)
+        _ACTIVE_RUNS[run.run_id] = run
+        _ACTIVE_SESSION_RUNS[normalized_session_id] = run.run_id
     return run
 
 
 def get_run(run_id: str) -> ActiveRun | None:
     """根据 run_id 读取仍在跟踪中的运行实例。"""
-    return _ACTIVE_RUNS.get(run_id)
+    with _RUN_REGISTRY_LOCK:
+        return _ACTIVE_RUNS.get(run_id)
 
 
 def cancel_run(run_id: str) -> bool:
@@ -101,12 +245,15 @@ def cancel_run(run_id: str) -> bool:
 
 def remove_run(run_id: str) -> None:
     """从内存中的活动运行表里移除一个运行实例。"""
-    _ACTIVE_RUNS.pop(run_id, None)
+    with _RUN_REGISTRY_LOCK:
+        run = _ACTIVE_RUNS.pop(run_id, None)
+        if run and _ACTIVE_SESSION_RUNS.get(run.session_id) == run_id:
+            _ACTIVE_SESSION_RUNS.pop(run.session_id, None)
 
 
 async def has_active_thread_memory(session_id: str) -> bool:
-    """检查这个 session 在 MemorySaver 里是否已有可继续复用的 thread checkpoint。"""
-    checkpointer = get_checkpointer()
+    """检查这个 session 是否已有可继续复用的 thread checkpoint。"""
+    checkpointer = await get_checkpointer()
     checkpoint = await checkpointer.aget_tuple({"configurable": {"thread_id": session_id}})
     return checkpoint is not None
 
@@ -116,11 +263,15 @@ async def clear_session_runtime_state(session_id: str) -> None:
     清掉某个 session 的运行时线程状态。
     这里删的是 checkpointer 里的 thread checkpoint，并顺手取消该 session 下正在跑的 run。
     """
-    checkpointer = get_checkpointer()
-    await checkpointer.adelete_thread(session_id)
+    checkpointer = await get_checkpointer()
+    normalized_session_id = _normalize_session_id(session_id)
+    await _delete_checkpoint_thread(checkpointer, normalized_session_id)
 
-    for run in list(_ACTIVE_RUNS.values()):
-        if run.session_id == session_id:
+    with _RUN_REGISTRY_LOCK:
+        runs = list(_ACTIVE_RUNS.values())
+
+    for run in runs:
+        if run.session_id == normalized_session_id:
             run.cancel_event.set()
 
 
@@ -138,23 +289,109 @@ def _build_model():
     )
 
 
-@lru_cache(maxsize=1)
-def get_checkpointer():
+def _resolve_checkpoint_sqlite_path() -> Path:
+    """解析 SQLite checkpoint 文件路径，并确保父目录存在。"""
+    path = Path(settings.checkpoint_sqlite_path)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+async def _build_sqlite_checkpointer() -> tuple[Any, Any | None]:
+    """创建 SQLite checkpointer；依赖缺失时回退到 MemorySaver。"""
+    try:
+        sqlite_checkpoint_module = importlib.import_module("langgraph.checkpoint.sqlite.aio")
+        AsyncSqliteSaver = getattr(sqlite_checkpoint_module, "AsyncSqliteSaver")
+    except ImportError:
+        logger.warning(
+            "CHECKPOINT_BACKEND=sqlite but langgraph-checkpoint-sqlite is not installed; "
+            "falling back to in-memory checkpointing."
+        )
+        return MemorySaver(), None
+
+    path = _resolve_checkpoint_sqlite_path()
+    context = AsyncSqliteSaver.from_conn_string(str(path))
+    if hasattr(context, "__aenter__"):
+        checkpointer = await context.__aenter__()
+        logger.info("Using SQLite LangGraph checkpoint store: %s", path)
+        return checkpointer, context
+
+    logger.info("Using SQLite LangGraph checkpoint store: %s", path)
+    return context, None
+
+
+async def get_checkpointer():
     """返回共享的 LangGraph checkpointer，用于保存线程级记忆。"""
-    return MemorySaver()
+    global _CHECKPOINTER, _CHECKPOINTER_CONTEXT
+
+    if _CHECKPOINTER is not None:
+        return _CHECKPOINTER
+
+    async with _CHECKPOINTER_LOCK:
+        if _CHECKPOINTER is not None:
+            return _CHECKPOINTER
+
+        if settings.checkpoint_backend == "sqlite":
+            _CHECKPOINTER, _CHECKPOINTER_CONTEXT = await _build_sqlite_checkpointer()
+        else:
+            logger.info("Using in-memory LangGraph checkpoint store.")
+            _CHECKPOINTER = MemorySaver()
+            _CHECKPOINTER_CONTEXT = None
+        return _CHECKPOINTER
 
 
-@lru_cache(maxsize=1)
+async def _delete_checkpoint_thread(checkpointer: Any, thread_id: str) -> None:
+    """兼容不同 checkpointer 实现的 thread 删除接口。"""
+    if hasattr(checkpointer, "adelete_thread"):
+        await checkpointer.adelete_thread(thread_id)
+        return
+    if hasattr(checkpointer, "delete_thread"):
+        await asyncio.to_thread(checkpointer.delete_thread, thread_id)
+        return
+    logger.warning("Configured checkpointer does not support deleting thread %s", thread_id)
+
+
+async def close_agent_runtime() -> None:
+    """关闭 agent 运行时资源，主要用于释放 SQLite checkpoint 连接。"""
+    global _AGENT, _CHECKPOINTER, _CHECKPOINTER_CONTEXT
+
+    async with _AGENT_LOCK:
+        _AGENT = None
+
+    async with _CHECKPOINTER_LOCK:
+        context = _CHECKPOINTER_CONTEXT
+        _CHECKPOINTER = None
+        _CHECKPOINTER_CONTEXT = None
+
+    if context is not None and hasattr(context, "__aexit__"):
+        await context.__aexit__(None, None, None)
+
+
 def get_store():
     """返回 deep agent 运行时共用的内存存储。"""
     return InMemoryStore()
 
 
-@lru_cache(maxsize=1)
-def get_agent():
+async def get_agent():
     """创建单例 deep agent，并给每个 subagent 绑定对应工具集。"""
+    global _AGENT
+
+    if _AGENT is not None:
+        return _AGENT
+
+    async with _AGENT_LOCK:
+        if _AGENT is not None:
+            return _AGENT
+
+        _AGENT = await _build_agent()
+        return _AGENT
+
+
+async def _build_agent():
+    """创建 deep agent 实例。"""
     model = _build_model()
-    checkpointer = get_checkpointer()
+    checkpointer = await get_checkpointer()
     store = get_store()
 
     def _make_backend(runtime):
@@ -386,6 +623,35 @@ def _build_tool_call_details(tool_names: list[str]) -> list[dict[str, Any]]:
     return details
 
 
+def _build_tool_call_detail(entry: ToolLedgerEntry) -> dict[str, Any]:
+    """把一次真实工具调用记录映射成前端和历史可消费的结构。"""
+    spec = get_tool_spec_by_agent_name(entry.name)
+    if spec is None:
+        payload = {
+            "name": entry.name,
+            "agent_name": entry.name,
+            "display_name": entry.name,
+            "description": "",
+            "category": "unknown",
+            "requires_network": None,
+            "latency": None,
+            "evidence_type": None,
+            "status": entry.status,
+        }
+    else:
+        payload = serialize_tool_spec(spec, name=entry.name, status=entry.status)
+
+    payload.update(
+        {
+            "runtime_status": entry.status,
+            "latency_ms": entry.latency_ms,
+            "args_hash": entry.args_hash,
+            "error": entry.error,
+        }
+    )
+    return payload
+
+
 def _extract_reply(result: dict[str, Any]) -> str:
     """从 deep agent 的结果结构中尽量提取最终回复文本。"""
     messages = result.get("messages", [])
@@ -451,11 +717,148 @@ def _build_stream_event(
     }
 
 
-def _build_runtime_message(message: str, history_context: str) -> str:
-    """在需要时把兜底历史上下文拼进当前用户消息。"""
-    if not history_context:
-        return message
-    return f"{history_context}\n\n{message}".strip()
+def _build_memory_context(memories: list[dict[str, Any]]) -> str:
+    """把长期记忆结果压缩成一个有限长度的提示块。"""
+    if not memories:
+        return ""
+
+    lines = [
+        "以下是与当前问题相关的长期记忆，仅作为补充上下文，不要覆盖当前用户输入。",
+    ]
+    total_chars = len(lines[0])
+
+    for item in memories:
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        created_at = str(item.get("created_at") or "")
+        role_scope = str(item.get("role_scope") or "")
+        prefix = f"- [{role_scope or 'memory'}"
+        if created_at:
+            prefix += f" | {created_at}"
+        prefix += f"] {text}"
+
+        if total_chars + len(prefix) > settings.memory_prompt_char_budget:
+            break
+        lines.append(prefix)
+        total_chars += len(prefix)
+
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines).strip()
+
+
+def _estimate_token_count(text: str) -> int:
+    """用轻量规则估算 token 数，避免为压缩判断引入额外 tokenizer 依赖。"""
+    if not text:
+        return 0
+
+    cjk_count = len(CJK_PATTERN.findall(text))
+    non_cjk_text = CJK_PATTERN.sub(" ", text)
+    latin_token_count = 0
+    for token in LATIN_TOKEN_PATTERN.findall(non_cjk_text):
+        if token.isspace():
+            continue
+        if re.fullmatch(r"[A-Za-z0-9_]+", token):
+            latin_token_count += max(1, round(len(token) / 4))
+        else:
+            latin_token_count += 1
+    return cjk_count + latin_token_count
+
+
+def _truncate_for_compression(text: str) -> str:
+    """压缩输入过长时保留开头结构和最近信息，降低压缩调用本身超长的风险。"""
+    max_chars = settings.context_compression_max_input_chars
+    if len(text) <= max_chars:
+        return text
+
+    recent_chars = min(settings.context_compression_fallback_recent_chars, max_chars // 2)
+    head_chars = max_chars - recent_chars
+    return (
+        text[:head_chars].rstrip()
+        + "\n\n...[中间上下文过长，已在压缩前省略]...\n\n"
+        + text[-recent_chars:].lstrip()
+    )
+
+
+def _fallback_compressed_context(supplemental_context: str) -> str:
+    """LLM 压缩失败时的保守兜底：保留最近上下文。"""
+    recent_chars = settings.context_compression_fallback_recent_chars
+    text = supplemental_context.strip()
+    if len(text) <= recent_chars:
+        return text
+    return "以下是因压缩服务不可用而保留的最近上下文片段：\n" + text[-recent_chars:].lstrip()
+
+
+async def _compress_supplemental_context(
+    *,
+    history_context: str,
+    memory_context: str,
+    current_message: str,
+) -> tuple[str, dict[str, Any]]:
+    """在超出预算时压缩补充上下文，当前用户消息保持原文。"""
+    supplemental_context = "\n\n".join(
+        part.strip()
+        for part in (
+            f"【历史对话】\n{history_context}" if history_context else "",
+            f"【长期记忆】\n{memory_context}" if memory_context else "",
+        )
+        if part.strip()
+    )
+    raw_runtime_message = _build_runtime_message(current_message, history_context, memory_context)
+    original_tokens = _estimate_token_count(raw_runtime_message)
+    meta: dict[str, Any] = {
+        "enabled": settings.context_compression_enabled,
+        "applied": False,
+        "original_tokens_estimate": original_tokens,
+        "final_tokens_estimate": original_tokens,
+        "trigger_tokens": settings.context_compression_trigger_tokens,
+        "target_tokens": settings.context_compression_target_tokens,
+        "error": None,
+    }
+
+    should_skip = (
+        not settings.context_compression_enabled
+        or not supplemental_context
+        or original_tokens <= settings.context_compression_trigger_tokens
+    )
+    if should_skip:
+        return raw_runtime_message, meta
+
+    compressed_context = ""
+    try:
+        parsed = await chat_json_completion(
+            messages=build_context_compression_messages(
+                current_message=current_message,
+                supplemental_context=_truncate_for_compression(supplemental_context),
+                target_tokens=settings.context_compression_target_tokens,
+            ),
+            temperature=0.1,
+            max_tokens=min(1800, max(600, settings.context_compression_target_tokens)),
+        )
+        compressed_context = str(parsed.get("compressed_context") or "").strip()
+    except Exception as exc:
+        logger.warning("Failed to compress runtime context: %s", exc)
+        meta["error"] = str(exc)
+
+    if not compressed_context:
+        compressed_context = _fallback_compressed_context(supplemental_context)
+        meta["error"] = meta["error"] or "empty_compression_result"
+
+    runtime_message = (
+        "以下是压缩后的历史上下文和长期记忆，仅作为补充参考，不要覆盖当前用户问题：\n"
+        f"{compressed_context.strip()}\n\n"
+        f"{current_message.strip()}"
+    ).strip()
+    meta["applied"] = True
+    meta["final_tokens_estimate"] = _estimate_token_count(runtime_message)
+    return runtime_message, meta
+
+
+def _build_runtime_message(message: str, history_context: str, memory_context: str) -> str:
+    """在需要时把历史上下文和长期记忆拼进当前用户消息。"""
+    parts = [part.strip() for part in (history_context, memory_context, message) if part and part.strip()]
+    return "\n\n".join(parts).strip()
 
 
 def _normalize_event(
@@ -463,6 +866,7 @@ def _normalize_event(
     session_id: str,
     run_id: str,
     sequence: int,
+    ledger: RunLedger,
     seen_subagents: set[str],
     seen_todos: set[str],
 ) -> dict[str, Any] | None:
@@ -494,10 +898,8 @@ def _normalize_event(
         )
 
     if event_name == "on_tool_start" and isinstance(name, str) and name != "task":
-        spec = get_tool_spec_by_agent_name(name)
-        payload = {"name": name, "status": "started"}
-        if spec is not None:
-            payload = serialize_tool_spec(spec, name=name, status="started")
+        entry = ledger.record_tool_start(event)
+        payload = _build_tool_call_detail(entry) if entry is not None else {"name": name, "status": "started"}
         return _build_stream_event(
             "tool",
             session_id,
@@ -507,10 +909,19 @@ def _normalize_event(
         )
 
     if event_name == "on_tool_end" and isinstance(name, str) and name != "task":
-        spec = get_tool_spec_by_agent_name(name)
-        payload = {"name": name, "status": "completed"}
-        if spec is not None:
-            payload = serialize_tool_spec(spec, name=name, status="completed")
+        entry = ledger.record_tool_end(event)
+        payload = _build_tool_call_detail(entry) if entry is not None else {"name": name, "status": "completed"}
+        return _build_stream_event(
+            "tool",
+            session_id,
+            run_id,
+            sequence,
+            payload,
+        )
+
+    if event_name == "on_tool_error" and isinstance(name, str) and name != "task":
+        entry = ledger.record_tool_error(event)
+        payload = _build_tool_call_detail(entry) if entry is not None else {"name": name, "status": "error"}
         return _build_stream_event(
             "tool",
             session_id,
@@ -533,13 +944,20 @@ def _normalize_event(
     return None
 
 
-def _build_final_response(result: dict[str, Any], session_id: str, event_texts: list[str], start: float) -> dict[str, Any]:
+def _build_final_response(
+    result: dict[str, Any],
+    session_id: str,
+    event_texts: list[str],
+    ledger: RunLedger,
+    context_compression: dict[str, Any],
+    start: float,
+) -> dict[str, Any]:
     """根据原始 agent 结果和事件轨迹组装最终 API 返回结构。"""
     messages = result.get("messages", [])
     reply = _extract_reply(result)
     used_subagents = _collect_used_subagents(messages, event_texts)
-    tool_calls_summary = _collect_tool_calls_summary(messages, event_texts)
-    tool_calls = _build_tool_call_details(tool_calls_summary)
+    tool_calls_summary = ledger.tool_names()
+    tool_calls = ledger.tool_details()
     sources = _collect_sources(reply)
     latency_ms = round((perf_counter() - start) * 1000, 2)
 
@@ -559,6 +977,7 @@ def _build_final_response(result: dict[str, Any], session_id: str, event_texts: 
         "tool_calls": tool_calls,
         "sources": sources,
         "latency_ms": latency_ms,
+        "context_compression": context_compression,
         "error": None,
     }
 
@@ -569,18 +988,31 @@ async def stream_agent_events(
     run_id: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """流式产出标准化运行事件，供 API 层转发为 SSE。"""
-    agent = get_agent()
+    session_id = _normalize_session_id(session_id)
+    if run_id is None:
+        run = create_run(session_id)
+        run_id = run.run_id
+
+    agent = await get_agent()
     start = perf_counter()
     final_result: dict[str, Any] | None = None
     event_texts: list[str] = []
+    ledger = RunLedger()
     seen_subagents: set[str] = set()
     seen_todos: set[str] = set()
     sequence = 0
-    current_run_id = run_id or uuid.uuid4().hex
+    current_run_id = run_id
     history_context = ""
     if not await has_active_thread_memory(session_id):
-        history_context = await build_history_context(session_id)
-    runtime_message = _build_runtime_message(message, history_context)
+        history_context = await build_history_context(
+            session_id,
+            limit=settings.memory_recent_history_limit,
+        )
+
+    memory_context = ""
+    memories = search_chat_memory(message, session_id, settings.memory_recall_top_k)
+    if memories:
+        memory_context = _build_memory_context(memories)
 
     yield _build_stream_event(
         "status",
@@ -590,6 +1022,43 @@ async def stream_agent_events(
         {"stage": "started", "message": "已开始处理请求"},
     )
     sequence += 1
+
+    should_try_compression = (
+        settings.context_compression_enabled
+        and (history_context or memory_context)
+        and _estimate_token_count(_build_runtime_message(message, history_context, memory_context))
+        > settings.context_compression_trigger_tokens
+    )
+    if should_try_compression:
+        yield _build_stream_event(
+            "status",
+            session_id,
+            current_run_id,
+            sequence,
+            {"stage": "compressing", "message": "上下文较长，正在压缩历史信息"},
+        )
+        sequence += 1
+
+    runtime_message, context_compression = await _compress_supplemental_context(
+        history_context=history_context,
+        memory_context=memory_context,
+        current_message=message,
+    )
+
+    if context_compression.get("applied"):
+        yield _build_stream_event(
+            "status",
+            session_id,
+            current_run_id,
+            sequence,
+            {
+                "stage": "compressed",
+                "message": "已压缩历史上下文",
+                "original_tokens_estimate": context_compression.get("original_tokens_estimate"),
+                "final_tokens_estimate": context_compression.get("final_tokens_estimate"),
+            },
+        )
+        sequence += 1
 
     try:
         async for event in agent.astream_events(
@@ -614,7 +1083,7 @@ async def stream_agent_events(
             event_text = str(event)
             event_texts.append(event_text)
 
-            normalized = _normalize_event(event, session_id, current_run_id, sequence, seen_subagents, seen_todos)
+            normalized = _normalize_event(event, session_id, current_run_id, sequence, ledger, seen_subagents, seen_todos)
             if normalized is not None:
                 yield normalized
                 sequence += 1
@@ -670,7 +1139,7 @@ async def stream_agent_events(
         session_id,
         current_run_id,
         sequence,
-        _build_final_response(final_result or {}, session_id, event_texts, start),
+        _build_final_response(final_result or {}, session_id, event_texts, ledger, context_compression, start),
     )
 
 

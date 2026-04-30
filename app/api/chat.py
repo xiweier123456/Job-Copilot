@@ -44,6 +44,7 @@ class ChatResponse(BaseModel):
     tool_calls: list[ToolCallInfo] = Field(default_factory=list, description="本轮结构化工具调用信息")
     sources: list[str] = Field(default_factory=list, description="从回复中提取到的参考链接")
     latency_ms: float = Field(..., description="本轮调用耗时，单位毫秒")
+    context_compression: dict = Field(default_factory=dict, description="上下文压缩元信息")
     error: str | None = Field(default=None, description="错误信息；成功时为 null")
 
 
@@ -95,6 +96,7 @@ def _build_turn_record(request: ChatRequest, result: dict, status: str) -> dict:
             "tool_calls_summary": result.get("tool_calls_summary") or [],
             "tool_calls": result.get("tool_calls") or [],
             "sources": result.get("sources") or [],
+            "context_compression": result.get("context_compression") or {},
         },
         "activity": {
             "latestStatus": latest_status,
@@ -160,17 +162,45 @@ def _empty_chat_result(session_id: str, error: str | None = None) -> dict:
         "tool_calls": [],
         "sources": [],
         "latency_ms": 0,
+        "context_compression": {},
         "error": error,
     }
 
 
 async def _stream_chat_request(http_request: Request, request: ChatRequest) -> StreamingResponse:
-    from app.agents.graph import AgentRunError, cancel_run, create_run, stream_agent_events
+    from app.agents.graph import AgentRunError, SessionBusyError, cancel_run, create_run, stream_agent_events
     from app.rag.chat_memory_store import save_chat_memory
     from app.services.chat_history_service import save_chat_turn
 
     message = _build_agent_message(request)
-    run = create_run(request.session_id)
+    try:
+        run = create_run(request.session_id)
+    except SessionBusyError as exc:
+        async def busy_generator():
+            yield _format_sse(
+                {
+                    "type": "error",
+                    "session_id": request.session_id,
+                    "run_id": exc.run_id,
+                    "sequence": 0,
+                    "timestamp": _utc_timestamp(),
+                    "payload": {
+                        "reason": "session_busy",
+                        "message": "当前会话已有回答正在生成，请先停止当前生成或等待完成后再发送。",
+                        "existing_run_id": exc.run_id,
+                    },
+                }
+            )
+
+        return StreamingResponse(
+            busy_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     async def event_generator():
         final_payload: dict | None = None

@@ -1,13 +1,27 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.api import health, jobs, resume, chat
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        yield
+    finally:
+        from app.agents.graph import close_agent_runtime
+
+        await close_agent_runtime()
+
+
 app = FastAPI(
     title=settings.app_title,
     version=settings.app_version,
     description="基于上市公司招聘数据的求职助手 Agent，支持岗位检索、简历匹配、面试准备。",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

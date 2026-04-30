@@ -1,150 +1,192 @@
 """
 app/rag/chat_memory_store.py
-对话语义记忆的 Milvus 读写封装。
+基于 mem0 + Milvus 的对话长期记忆封装。
 
-这里是语义召回层，不是完整历史的唯一来源：
+职责边界：
 - 完整 transcript 仍然保存在 chat_history_service 中
-- 这里额外保存可检索的对话文本，供未来按语义召回相关历史
+- 这里负责长期语义记忆的写入、搜索与清空
+- 对外继续保持 save/search/clear 接口，尽量不影响上层调用
 """
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
-from pymilvus import Collection, connections
+from mem0 import Memory
 
 from app.config import settings
-from app.rag.embedder import embed_query, embed_texts
 
-OUTPUT_FIELDS = [
-    "memory_id",
-    "session_id",
-    "role_scope",
-    "text",
-    "created_at",
-    "status",
-]
+logger = logging.getLogger(__name__)
+
+
+def _resolve_history_db_path() -> str:
+    path = Path(settings.mem0_history_db_path)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[2] / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _build_mem0_config() -> dict[str, Any]:
+    embedder_model = settings.mem0_embedder_model or settings.embedding_model
+    embedder_dims = settings.mem0_embedder_dims or settings.embedding_dim
+    llm_model = settings.mem0_llm_model or settings.service_llm_model
+
+    vector_config: dict[str, Any] = {
+        "collection_name": settings.mem0_collection_name,
+        "embedding_model_dims": embedder_dims,
+        "url": f"http://{settings.milvus_host}:{settings.milvus_port}",
+        "token": "",
+        "db_name": "",
+    }
+
+    config: dict[str, Any] = {
+        "vector_store": {
+            "provider": "milvus",
+            "config": vector_config,
+        },
+        "history_db_path": _resolve_history_db_path(),
+        "version": "v1.1",
+        "llm": {
+            "provider": settings.mem0_llm_provider,
+            "config": {
+                "model": llm_model,
+                "api_key": settings.service_llm_api_key,
+                "deepseek_base_url": settings.service_llm_base_url,
+                "temperature": 0.1,
+            },
+        },
+        "embedder": {
+            "provider": settings.mem0_embedder_provider,
+            "config": {
+                "model": embedder_model,
+                "embedding_dims": embedder_dims,
+            },
+        },
+    }
+
+    if settings.mem0_embedder_provider == "openai":
+        config["embedder"]["config"].update(
+            {
+                "api_key": settings.service_llm_api_key,
+                "openai_base_url": settings.service_llm_base_url,
+            }
+        )
+
+    if settings.mem0_embedder_provider == "huggingface":
+        config["embedder"]["config"].pop("embedding_dims", None)
+
+    return config
 
 
 @lru_cache(maxsize=1)
-def _get_collection() -> Collection:
-    """懒加载 Milvus chat_memory collection，避免每次调用都重复连接。"""
-    connections.connect(host=settings.milvus_host, port=settings.milvus_port)
-    collection = Collection(settings.milvus_chat_memory_collection)
-    collection.load()
-    return collection
+def _get_memory_client() -> Memory:
+    return Memory.from_config(_build_mem0_config())
 
 
-def _get_text_max_length(collection: Collection) -> int:
-    """读取当前 collection 的 text 字段上限，避免本地常量和实际 schema 不一致。"""
-    for field in collection.schema.fields:
-        if field.name == "text":
-            return int(field.params.get("max_length") or 4096)
-    return 4096
+def _session_memory_scope(session_id: str) -> dict[str, str]:
+    safe_session_id = (session_id or "default").strip() or "default"
+    return {
+        "user_id": safe_session_id,
+        "agent_id": "job-copilot-chat-memory",
+    }
 
 
-def _fit_memory_text(text: str, max_length: int) -> str:
-    """把待入库文本截断到 Milvus varchar 上限内，避免 insert 因超长失败。"""
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_length:
-        return text
-
-    ellipsis = "…"
-    ellipsis_bytes = len(ellipsis.encode("utf-8"))
-    clipped = encoded[: max_length - ellipsis_bytes]
-
-    while clipped:
-        try:
-            return clipped.decode("utf-8").rstrip() + ellipsis
-        except UnicodeDecodeError:
-            clipped = clipped[:-1]
-
-    return ellipsis if ellipsis_bytes <= max_length else ""
-
+def _normalize_memory_result(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata") or {}
+    return {
+        "memory_id": item.get("id", ""),
+        "session_id": item.get("user_id") or metadata.get("session_id", ""),
+        "role_scope": metadata.get("role_scope", ""),
+        "text": item.get("memory", ""),
+        "created_at": item.get("created_at", ""),
+        "status": metadata.get("status", ""),
+        "score": round(float(item.get("score", 0.0)), 4) if item.get("score") is not None else 0.0,
+    }
 
 
 async def save_chat_memory(turn: dict) -> None:
     """
-    把一轮对话写入语义记忆层。
+    把一轮对话写入长期语义记忆。
     user 消息单独存；assistant 只有成功完成时才和 user 组成整轮文本入库。
     """
+    if not settings.memory_enabled:
+        return
+
     user_message = str(turn.get("user_message") or "").strip()
     assistant_message = str(turn.get("assistant_message") or "").strip()
     status = str(turn.get("status") or "done").strip()
-
-    collection = _get_collection()
-    max_text_length = _get_text_max_length(collection)
-
-    texts: list[str] = []
-    role_scopes: list[str] = []
-    memory_ids: list[str] = []
-
-    if user_message:
-        texts.append(_fit_memory_text(user_message, max_text_length))
-        role_scopes.append("user")
-        memory_ids.append(f"{turn['turn_id']}-user")
-
-    # 文档入库使用 embed_texts()；未来查询时再用 embed_query()，保持文档侧和查询侧分工清晰。
-    if status == "done" and assistant_message:
-        turn_text = _fit_memory_text(
-            f"用户：{user_message}\n助手：{assistant_message}".strip(),
-            max_text_length,
-        )
-        texts.append(turn_text)
-        role_scopes.append("turn")
-        memory_ids.append(f"{turn['turn_id']}-turn")
-
-    if not texts:
-        return
-
-    vectors = embed_texts(texts)
     session_id = str(turn.get("session_id") or "default")
     created_at = str(turn.get("created_at") or "")
+    turn_id = str(turn.get("turn_id") or "")
+    scope = _session_memory_scope(session_id)
+    client = _get_memory_client()
 
-    collection.insert([
-        memory_ids,
-        [session_id] * len(texts),
-        role_scopes,
-        texts,
-        vectors,
-        [created_at] * len(texts),
-        [status] * len(texts),
-    ])
-    collection.flush()
+    try:
+        if user_message:
+            client.add(
+                [{"role": "user", "content": user_message}],
+                metadata={
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "created_at": created_at,
+                    "role_scope": "user",
+                    "status": status,
+                },
+                infer=False,
+                **scope,
+            )
+
+        if status == "done" and assistant_message:
+            client.add(
+                [
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": assistant_message},
+                ],
+                metadata={
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "created_at": created_at,
+                    "role_scope": "turn",
+                    "status": status,
+                },
+                infer=True,
+                **scope,
+            )
+    except Exception:
+        logger.exception("Failed to save chat memory for session %s", session_id)
 
 
 async def clear_chat_memory(session_id: str) -> None:
-    # chat_memory 是语义召回层；清空 session 时也必须同步删掉，避免旧记忆被再次召回。
-    collection = _get_collection()
-    expr = f'session_id == "{session_id}"'
-    collection.delete(expr)
-    collection.flush()
+    """清空某个 session 的长期语义记忆。"""
+    if not settings.memory_enabled:
+        return
+
+    client = _get_memory_client()
+    try:
+        client.delete_all(**_session_memory_scope(session_id))
+    except Exception:
+        logger.exception("Failed to clear chat memory for session %s", session_id)
 
 
 def search_chat_memory(query: str, session_id: str, top_k: int = 3) -> list[dict]:
     """按语义相似度召回某个 session 下最相关的历史记忆。"""
-    collection = _get_collection()
-    query_vector = embed_query(query)
-    expr = f'session_id == "{session_id}"'
+    if not settings.memory_enabled or not query.strip():
+        return []
 
-    results = collection.search(
-        data=[query_vector],
-        anns_field="vector",
-        param={"metric_type": "COSINE", "params": {"ef": 64}},
-        limit=top_k,
-        expr=expr,
-        output_fields=OUTPUT_FIELDS,
-    )
+    client = _get_memory_client()
+    try:
+        response = client.search(
+            query=query,
+            limit=top_k,
+            threshold=settings.memory_recall_score_threshold,
+            **_session_memory_scope(session_id),
+        )
+    except Exception:
+        logger.exception("Failed to search chat memory for session %s", session_id)
+        return []
 
-    hits: list[dict] = []
-    for hit in results[0]:
-        entity = hit.entity
-        hits.append({
-            "memory_id": entity.get("memory_id", ""),
-            "session_id": entity.get("session_id", ""),
-            "role_scope": entity.get("role_scope", ""),
-            "text": entity.get("text", ""),
-            "created_at": entity.get("created_at", ""),
-            "status": entity.get("status", ""),
-            "score": round(float(hit.score), 4),
-        })
-    return hits
+    results = response.get("results") or []
+    return [_normalize_memory_result(item) for item in results]

@@ -18,7 +18,7 @@ def compact(obj) -> str:
 
 
 async def main() -> None:
-    agent = get_agent()
+    agent = await get_agent()
     inputs = {
         "messages": [
             {

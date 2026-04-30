@@ -7,14 +7,16 @@ agent wrapper 导出、subagent 工具分组在多个文件里逐渐漂移。
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
-from threading import Thread
+from threading import Lock, Thread
+from time import monotonic
 from typing import Any, Callable, Literal
 
 from langchain_core.tools import StructuredTool, tool
 from pydantic import Field, create_model
 
-from app.config import ExternalMCPServiceConfig
+from app.config import ExternalMCPServiceConfig, settings
 from app.mcp.external_service_registry import (
     discover_external_services,
     call_external_tool,
@@ -38,6 +40,9 @@ EvidenceType = Literal[
     "external_mcp",
 ]
 SourceType = Literal["local", "external_mcp"]
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -324,8 +329,8 @@ def _infer_external_category(tool_name: str, description: str) -> ToolCategory:
     if any(keyword in haystack for keyword in ("search", "research", "query")):
         return "web_search"
     if any(keyword in haystack for keyword in ("extract", "crawl", "fetch", "scrape")):
-        return "info_extract"
-    
+        return "web_extract"
+
     return "external_mcp"
 
 
@@ -456,10 +461,70 @@ def _build_external_tool_specs() -> tuple[ToolSpec, ...]:
     return tuple(sorted(winners, key=lambda spec: (spec.source_name, spec.agent_name)))
 
 
+_EXTERNAL_TOOL_CACHE_LOCK = Lock()
+_EXTERNAL_TOOL_CACHE: tuple[ToolSpec, ...] | None = None
+_EXTERNAL_TOOL_CACHE_EXPIRES_AT = 0.0
+_EXTERNAL_TOOL_CACHE_RETRY_AT = 0.0
+
+
+def _external_discovery_ttl_seconds() -> int:
+    """读取外部 MCP 工具清单缓存时间，配置异常时使用保守默认值。"""
+    value = getattr(settings, "mcp_external_discovery_ttl_seconds", 60)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 60
+
+
+def _external_discovery_failure_ttl_seconds() -> int:
+    """读取外部 MCP 发现失败后的重试冷却时间。"""
+    value = getattr(settings, "mcp_external_discovery_failure_ttl_seconds", 30)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 30
+
+
+def refresh_external_tool_specs() -> tuple[ToolSpec, ...]:
+    """强制刷新外部 MCP 工具缓存，适合管理接口或调试脚本调用。"""
+    return _get_cached_external_tool_specs(force_refresh=True)
+
+
+def _get_cached_external_tool_specs(*, force_refresh: bool = False) -> tuple[ToolSpec, ...]:
+    """返回带 TTL 缓存的外部 MCP 工具规格，避免运行时频繁连接远端服务。"""
+    global _EXTERNAL_TOOL_CACHE, _EXTERNAL_TOOL_CACHE_EXPIRES_AT, _EXTERNAL_TOOL_CACHE_RETRY_AT
+
+    now = monotonic()
+    with _EXTERNAL_TOOL_CACHE_LOCK:
+        cached = _EXTERNAL_TOOL_CACHE
+        if not force_refresh and cached is not None and now < _EXTERNAL_TOOL_CACHE_EXPIRES_AT:
+            return cached
+        if not force_refresh and cached is not None and now < _EXTERNAL_TOOL_CACHE_RETRY_AT:
+            return cached
+
+    try:
+        specs = _build_external_tool_specs()
+    except Exception as exc:
+        logger.warning("Failed to refresh external MCP tools: %s", exc)
+        with _EXTERNAL_TOOL_CACHE_LOCK:
+            cached = _EXTERNAL_TOOL_CACHE
+            _EXTERNAL_TOOL_CACHE_RETRY_AT = monotonic() + _external_discovery_failure_ttl_seconds()
+            if cached is not None:
+                return cached
+            _EXTERNAL_TOOL_CACHE = ()
+        return ()
+
+    with _EXTERNAL_TOOL_CACHE_LOCK:
+        _EXTERNAL_TOOL_CACHE = specs
+        _EXTERNAL_TOOL_CACHE_EXPIRES_AT = monotonic() + _external_discovery_ttl_seconds()
+        _EXTERNAL_TOOL_CACHE_RETRY_AT = 0.0
+    return specs
+
+
 def get_tool_specs() -> tuple[ToolSpec, ...]:
     """返回当前启用的全部工具规格。"""
     local_specs = tuple(spec for spec in LOCAL_TOOL_SPECS if spec.enabled)
-    external_specs = _build_external_tool_specs()
+    external_specs = _get_cached_external_tool_specs()
     return local_specs + external_specs
 
 
