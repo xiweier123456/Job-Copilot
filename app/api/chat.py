@@ -1,64 +1,22 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-from datetime import datetime, timezone
-import json
+
+from app.schemas.chat import (
+    ChatHistoryMessage,
+    ChatHistoryResponse,
+    ChatModelOptionsResponse,
+    ChatRequest,
+    ChatSessionListResponse,
+    ClearChatRequest,
+    StopChatRequest,
+)
 
 router = APIRouter()
-
-
-class ChatRequest(BaseModel):
-    message: str = Field(..., description="用户输入的消息")
-    session_id: str = Field(default="default", description="会话 ID")
-    user_profile: str | None = Field(default=None, description="用户背景信息，可选")
-    target_city: str | None = Field(default=None, description="目标城市，可选")
-    job_direction: str | None = Field(default=None, description="目标岗位方向，可选")
-    resume_text: str | None = Field(default=None, description="简历文本，可选")
-
-
-class StopChatRequest(BaseModel):
-    run_id: str = Field(..., description="需要停止的运行 ID")
-
-
-class ClearChatRequest(BaseModel):
-    session_id: str = Field(..., description="需要清空的会话 ID")
-
-
-class ToolCallInfo(BaseModel):
-    name: str = Field(..., description="运行时工具名")
-    agent_name: str = Field(..., description="agent wrapper 名称")
-    display_name: str = Field(..., description="前端展示用中文工具名")
-    description: str = Field(default="", description="工具用途说明")
-    category: str = Field(default="unknown", description="工具分类")
-    requires_network: bool | None = Field(default=None, description="是否需要联网")
-    latency: str | None = Field(default=None, description="预计耗时等级")
-    evidence_type: str | None = Field(default=None, description="输出证据类型")
-    status: str | None = Field(default=None, description="当前工具状态")
-
-
-class ChatResponse(BaseModel):
-    reply: str = Field(..., description="Agent 的回复")
-    session_id: str = Field(..., description="会话 ID，原样返回")
-    used_subagents: list[str] = Field(default_factory=list, description="本轮实际使用的子 Agent")
-    tool_calls_summary: list[str] = Field(default_factory=list, description="本轮识别到的工具调用摘要")
-    tool_calls: list[ToolCallInfo] = Field(default_factory=list, description="本轮结构化工具调用信息")
-    sources: list[str] = Field(default_factory=list, description="从回复中提取到的参考链接")
-    latency_ms: float = Field(..., description="本轮调用耗时，单位毫秒")
-    context_compression: dict = Field(default_factory=dict, description="上下文压缩元信息")
-    error: str | None = Field(default=None, description="错误信息；成功时为 null")
-
-
-class ChatHistoryMessage(BaseModel):
-    role: str = Field(..., description="消息角色")
-    content: str = Field(..., description="消息内容")
-    status: str | None = Field(default=None, description="agent 消息状态")
-    meta: dict = Field(default_factory=dict, description="agent 元信息")
-    activity: dict = Field(default_factory=dict, description="agent 活动信息")
-
-
-class ChatHistoryResponse(BaseModel):
-    session_id: str = Field(..., description="会话 ID")
-    messages: list[ChatHistoryMessage] = Field(default_factory=list, description="按时间顺序展开的历史消息")
 
 
 def _utc_timestamp() -> str:
@@ -91,12 +49,16 @@ def _build_turn_record(request: ChatRequest, result: dict, status: str) -> dict:
             "resume_text": request.resume_text,
         },
         "meta": {
+            "run_id": result.get("run_id"),
+            "model_provider": result.get("model_provider") or request.agent_model_provider,
+            "model_name": result.get("model_name"),
             "latency_ms": result.get("latency_ms"),
             "used_subagents": result.get("used_subagents") or [],
             "tool_calls_summary": result.get("tool_calls_summary") or [],
             "tool_calls": result.get("tool_calls") or [],
             "sources": result.get("sources") or [],
             "context_compression": result.get("context_compression") or {},
+            "trace": result.get("trace") or {},
         },
         "activity": {
             "latestStatus": latest_status,
@@ -104,6 +66,7 @@ def _build_turn_record(request: ChatRequest, result: dict, status: str) -> dict:
             "subagents": result.get("used_subagents") or [],
             "tools": result.get("tool_calls_summary") or [],
             "toolDetails": result.get("tool_calls") or [],
+            "trace": result.get("trace") or {},
             "errorMessage": error_message,
         },
     }
@@ -157,12 +120,16 @@ def _empty_chat_result(session_id: str, error: str | None = None) -> dict:
     return {
         "reply": "",
         "session_id": session_id,
+        "run_id": None,
+        "model_provider": None,
+        "model_name": None,
         "used_subagents": [],
         "tool_calls_summary": [],
         "tool_calls": [],
         "sources": [],
         "latency_ms": 0,
         "context_compression": {},
+        "trace": {},
         "error": error,
     }
 
@@ -207,7 +174,12 @@ async def _stream_chat_request(http_request: Request, request: ChatRequest) -> S
         final_status = "stopped"
 
         try:
-            async for event in stream_agent_events(message, request.session_id, run.run_id):
+            async for event in stream_agent_events(
+                message,
+                request.session_id,
+                run.run_id,
+                model_provider=request.agent_model_provider,
+            ):
                 event_type = event.get("type")
                 payload = event.get("payload") or {}
 
@@ -257,6 +229,7 @@ async def _build_chat_request_from_upload(
     resume_file: UploadFile,
     message: str,
     session_id: str = "default",
+    agent_model_provider: str = "",
     user_profile: str = "",
     target_city: str = "",
     job_direction: str = "",
@@ -267,6 +240,7 @@ async def _build_chat_request_from_upload(
     return ChatRequest(
         message=message,
         session_id=session_id,
+        agent_model_provider=agent_model_provider or None,
         user_profile=user_profile or None,
         target_city=target_city or None,
         job_direction=job_direction or None,
@@ -282,17 +256,19 @@ async def chat_stream(http_request: Request, request: ChatRequest):
 @router.post("/stream/upload")
 async def chat_stream_upload(
     http_request: Request,
-    resume_file: UploadFile = File(..., description="上传的 PDF 简历"),
-    message: str = Form(..., description="用户输入的消息"),
-    session_id: str = Form(default="default", description="会话 ID"),
-    user_profile: str = Form(default="", description="用户背景信息，可选"),
-    target_city: str = Form(default="", description="目标城市，可选"),
-    job_direction: str = Form(default="", description="目标岗位方向，可选"),
+    resume_file: UploadFile = File(..., description="PDF resume file"),
+    message: str = Form(..., description="User message"),
+    session_id: str = Form(default="default", description="Conversation session ID"),
+    agent_model_provider: str = Form(default="", description="Agent model provider"),
+    user_profile: str = Form(default="", description="Optional user background"),
+    target_city: str = Form(default="", description="Optional target city"),
+    job_direction: str = Form(default="", description="Optional target job direction"),
 ):
     request = await _build_chat_request_from_upload(
         resume_file=resume_file,
         message=message,
         session_id=session_id,
+        agent_model_provider=agent_model_provider,
         user_profile=user_profile,
         target_city=target_city,
         job_direction=job_direction,
@@ -308,6 +284,20 @@ async def get_chat_history(session_id: str = "default"):
     return _expand_turns_to_messages(session_id, turns)
 
 
+@router.get("/sessions", response_model=ChatSessionListResponse)
+async def get_chat_sessions():
+    from app.services.chat_history_service import list_chat_sessions
+
+    return ChatSessionListResponse(sessions=await list_chat_sessions())
+
+
+@router.get("/model-options", response_model=ChatModelOptionsResponse)
+async def get_chat_model_options():
+    from app.agents.model_registry import get_agent_model_options
+
+    return ChatModelOptionsResponse(models=get_agent_model_options())
+
+
 @router.post("/clear")
 async def clear_chat(request: ClearChatRequest):
     from app.agents.graph import clear_session_runtime_state
@@ -318,6 +308,18 @@ async def clear_chat(request: ClearChatRequest):
     await clear_chat_memory(request.session_id)
     await clear_session_runtime_state(request.session_id)
     return {"ok": True, "session_id": request.session_id}
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_chat_session(session_id: str):
+    from app.agents.graph import clear_session_runtime_state
+    from app.rag.chat_memory_store import clear_chat_memory
+    from app.services.chat_history_service import clear_chat_history
+
+    await clear_chat_history(session_id)
+    await clear_chat_memory(session_id)
+    await clear_session_runtime_state(session_id)
+    return {"ok": True, "session_id": session_id}
 
 
 @router.post("/stop")

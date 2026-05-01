@@ -18,3 +18,7 @@ langchain-openai>=0.2.0
 deepagents>=0.4.12
 mem0ai>=1.0.11
 pypdf>=5.0.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+respx>=0.21.0
+redis>=5.0.0

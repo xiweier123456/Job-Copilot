@@ -16,6 +16,12 @@ from app.services.tavily_client import (
     tavily_research as _tavily_research,
     tavily_search as _tavily_search,
 )
+from app.security.tool_safety import (
+    blocked_tool_result,
+    enforce_domain_policy,
+    enforce_url_policy,
+    redact_sensitive_text,
+)
 
 
 def _split_csv(value: str) -> list[str] | None:
@@ -36,13 +42,13 @@ def _build_search_items(items: list[dict[str, Any]], limit: int) -> list[dict[st
     """
     output = []
     for item in items[:limit]:
-        content = (item.get("content") or "").strip()
+        content = redact_sensitive_text((item.get("content") or "").strip(), limit=240)
         output.append(
             {
                 "title": item.get("title") or "无标题",
                 "url": item.get("url") or "无链接",
                 "score": item.get("score"),
-                "snippet": content[:240] + ("..." if len(content) > 240 else ""),
+                "snippet": content,
             }
         )
     return output
@@ -61,14 +67,23 @@ async def tavily_search(
     这个封装主要用于快速获取最新网页信息；即使 Tavily 服务异常，
     也会返回稳定的错误结构，方便上层统一处理。
     """
+    policy = enforce_domain_policy(
+        tool="tavily_search",
+        include_domains=_split_csv(include_domains),
+        exclude_domains=_split_csv(exclude_domains),
+        input_preview={"query": query, "include_domains": include_domains, "exclude_domains": exclude_domains},
+    )
+    if not policy.allowed:
+        return blocked_tool_result("tavily_search", policy.security, "联网搜索域名不在允许列表内。")
+
     try:
         result = await _tavily_search(
             query=query,
             max_results=max_results,
             topic=topic,
             time_range=time_range or None,
-            include_domains=_split_csv(include_domains),
-            exclude_domains=_split_csv(exclude_domains),
+            include_domains=policy.include_domains,
+            exclude_domains=policy.exclude_domains,
             include_answer=True,
         )
     except TavilyError as exc:
@@ -80,12 +95,15 @@ async def tavily_search(
         }
 
     items = _build_search_items(result.get("results") or [], max_results)
-    summary = result.get("answer") or (f"共检索到 {len(items)} 条网络结果。" if items else "未检索到相关网络结果。")
+    answer = result.get("answer")
+    summary = redact_sensitive_text(answer) if isinstance(answer, str) else ""
+    summary = summary or (f"共检索到 {len(items)} 条网络结果。" if items else "未检索到相关网络结果。")
     return {
         "tool": "tavily_search",
         "summary": summary,
         "data": items,
         "sources": [item.get("url") for item in items if item.get("url") and item.get("url") != "无链接"],
+        "security": policy.security,
     }
 
 
@@ -96,12 +114,21 @@ async def tavily_research(
     max_results: int = 5,
 ) -> dict:
     """执行 Tavily 深度研究模式，适合多来源总结与对比分析。"""
+    policy = enforce_domain_policy(
+        tool="tavily_research",
+        include_domains=_split_csv(include_domains),
+        exclude_domains=_split_csv(exclude_domains),
+        input_preview={"query": query, "include_domains": include_domains, "exclude_domains": exclude_domains},
+    )
+    if not policy.allowed:
+        return blocked_tool_result("tavily_research", policy.security, "深度研究域名不在允许列表内。")
+
     try:
         result = await _tavily_research(
             query=query,
             max_results=max_results,
-            include_domains=_split_csv(include_domains),
-            exclude_domains=_split_csv(exclude_domains),
+            include_domains=policy.include_domains,
+            exclude_domains=policy.exclude_domains,
         )
     except TavilyError as exc:
         return {
@@ -123,7 +150,7 @@ async def tavily_research(
     for key in ("summary", "answer", "report"):
         value = result.get(key)
         if isinstance(value, str) and value.strip():
-            summary = value.strip()
+            summary = redact_sensitive_text(value.strip())
             break
     if not summary:
         summary = "未返回可用研究总结。"
@@ -132,6 +159,7 @@ async def tavily_research(
         "summary": summary,
         "data": sources,
         "sources": [item["url"] for item in sources if item["url"] != "无链接"],
+        "security": policy.security,
     }
 
 
@@ -146,8 +174,16 @@ async def tavily_extract(urls: str) -> dict:
             "limitations": ["输入为空。"],
         }
 
+    policy = enforce_url_policy(
+        tool="tavily_extract",
+        urls=url_list,
+        input_preview={"urls": url_list},
+    )
+    if not policy.allowed:
+        return blocked_tool_result("tavily_extract", policy.security, "页面抽取 URL 不在允许列表内。")
+
     try:
-        result = await _tavily_extract(url_list)
+        result = await _tavily_extract(policy.urls)
     except TavilyError as exc:
         return {
             "tool": "tavily_extract",
@@ -159,20 +195,25 @@ async def tavily_extract(urls: str) -> dict:
     items = result.get("results") or result.get("data") or []
     data = []
     for idx, item in enumerate(items[:5], start=1):
-        url = item.get("url") or url_list[min(idx - 1, len(url_list) - 1)]
+        url = item.get("url") or policy.urls[min(idx - 1, len(policy.urls) - 1)]
         raw = (item.get("raw_content") or item.get("content") or "").strip()
         data.append(
             {
                 "url": url,
-                "content": raw[:800] + ("..." if len(raw) > 800 else ""),
+                "content": redact_sensitive_text(raw, limit=800),
             }
         )
     summary = f"已提取 {len(data)} 个页面内容。" if data else "未提取到页面内容。"
+    limitations = []
+    if policy.blocked_urls:
+        limitations.append("部分 URL 因不在允许列表内已跳过。")
     return {
         "tool": "tavily_extract",
         "summary": summary,
         "data": data,
         "sources": [item["url"] for item in data],
+        "limitations": limitations,
+        "security": policy.security,
     }
 
 
@@ -191,6 +232,15 @@ async def batch_tavily_search(
             "limitations": ["输入为空。"],
         }
 
+    policy = enforce_domain_policy(
+        tool="batch_tavily_search",
+        include_domains=None,
+        exclude_domains=None,
+        input_preview={"queries": query_list},
+    )
+    if not policy.allowed:
+        return blocked_tool_result("batch_tavily_search", policy.security, "批量联网搜索域名不在允许列表内。")
+
     async def _single_search(query: str) -> dict[str, Any]:
         """执行批量任务中的单个搜索，并把失败情况也标准化。"""
         try:
@@ -198,6 +248,8 @@ async def batch_tavily_search(
                 query=query,
                 max_results=max_results_per_query,
                 time_range=time_range or None,
+                include_domains=policy.include_domains,
+                exclude_domains=policy.exclude_domains,
                 include_answer=True,
             )
         except TavilyError as exc:
@@ -209,7 +261,8 @@ async def batch_tavily_search(
 
         return {
             "query": query,
-            "summary": (result.get("answer") or "").strip() or f"共检索到 {len(result.get('results') or [])} 条结果。",
+            "summary": redact_sensitive_text((result.get("answer") or "").strip())
+            or f"共检索到 {len(result.get('results') or [])} 条结果。",
             "results": _build_search_items(result.get("results") or [], max_results_per_query),
         }
 
@@ -224,4 +277,5 @@ async def batch_tavily_search(
             for item in group.get("results", [])
             if item.get("url") and item.get("url") != "无链接"
         ],
+        "security": policy.security,
     }

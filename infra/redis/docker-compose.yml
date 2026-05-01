@@ -1,0 +1,21 @@
+services:
+  redis:
+    image: redis:6-alpine
+    container_name: job-copilot-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --save
+      - "60"
+      - "1"
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - E:/docker/job-copilot/redis/data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

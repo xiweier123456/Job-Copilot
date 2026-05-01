@@ -11,6 +11,8 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+pytest-cache-files-*/
 dist/
 build/
 *.egg
@@ -41,3 +43,9 @@ Thumbs.db
 # ═══════════════════════════════════════════
 outputs/
 *.log
+
+# Frontend local artifacts
+node_modules/
+vue/node_modules/
+vue/dist/
+vue/.vite/

@@ -34,6 +34,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 
 from app.config import settings
+from app.agents.model_registry import AgentModelSpec, resolve_agent_model_spec
 from app.prompts.agent_prompts import (
     build_career_agent_prompt,
     build_interview_agent_prompt,
@@ -42,6 +43,7 @@ from app.prompts.agent_prompts import (
     build_resume_agent_prompt,
 )
 from app.prompts.service_prompts import build_context_compression_messages
+from app.services import cache_service
 from app.services.llm_client import chat_json_completion
 from app.services.chat_history_service import build_history_context
 from app.rag.chat_memory_store import search_chat_memory
@@ -204,7 +206,7 @@ _RUN_REGISTRY_LOCK = Lock()
 _CHECKPOINTER: Any | None = None
 _CHECKPOINTER_CONTEXT: Any | None = None
 _CHECKPOINTER_LOCK = asyncio.Lock()
-_AGENT: Any | None = None
+_AGENT_CACHE: dict[str, Any] = {}
 _AGENT_LOCK = asyncio.Lock()
 
 
@@ -212,6 +214,14 @@ def _normalize_session_id(session_id: str) -> str:
     """把空 session 统一映射到 default，避免并发注册绕过。"""
     normalized = (session_id or "default").strip()
     return normalized or "default"
+
+
+def _active_run_key(session_id: str) -> str:
+    return cache_service.build_cache_key("run", "active", session_id)
+
+
+def _run_status_key(run_id: str) -> str:
+    return cache_service.build_cache_key("run", "status", run_id)
 
 
 def create_run(session_id: str) -> ActiveRun:
@@ -223,8 +233,23 @@ def create_run(session_id: str) -> ActiveRun:
             raise SessionBusyError(normalized_session_id, existing_run_id)
 
         run = ActiveRun(run_id=uuid.uuid4().hex, session_id=normalized_session_id)
+        redis_lock = cache_service.acquire_lock_sync(
+            _active_run_key(normalized_session_id),
+            run.run_id,
+            settings.redis_run_lock_ttl_seconds,
+        )
+        if redis_lock is False:
+            redis_run_id = cache_service.get_text_sync(_active_run_key(normalized_session_id)) or "unknown"
+            raise SessionBusyError(normalized_session_id, redis_run_id)
+
         _ACTIVE_RUNS[run.run_id] = run
         _ACTIVE_SESSION_RUNS[normalized_session_id] = run.run_id
+
+    cache_service.set_text_sync(
+        _run_status_key(run.run_id),
+        "running",
+        ttl_seconds=settings.redis_run_lock_ttl_seconds,
+    )
     return run
 
 
@@ -237,10 +262,12 @@ def get_run(run_id: str) -> ActiveRun | None:
 def cancel_run(run_id: str) -> bool:
     """标记某个运行实例为已取消，并返回它是否存在。"""
     run = get_run(run_id)
-    if run is None:
-        return False
-    run.cancel_event.set()
-    return True
+    existing_status = cache_service.get_text_sync(_run_status_key(run_id))
+    cache_service.set_text_sync(_run_status_key(run_id), "cancelled", ttl_seconds=settings.redis_run_lock_ttl_seconds)
+    if run is not None:
+        run.cancel_event.set()
+        return True
+    return existing_status is not None
 
 
 def remove_run(run_id: str) -> None:
@@ -249,6 +276,17 @@ def remove_run(run_id: str) -> None:
         run = _ACTIVE_RUNS.pop(run_id, None)
         if run and _ACTIVE_SESSION_RUNS.get(run.session_id) == run_id:
             _ACTIVE_SESSION_RUNS.pop(run.session_id, None)
+    if run:
+        cache_service.release_lock_sync(_active_run_key(run.session_id), run_id)
+    if cache_service.get_text_sync(_run_status_key(run_id)) != "cancelled":
+        cache_service.set_text_sync(_run_status_key(run_id), "done", ttl_seconds=settings.redis_default_ttl_seconds)
+
+
+def _is_run_cancelled(run_id: str) -> bool:
+    run = get_run(run_id)
+    if run and run.cancel_event.is_set():
+        return True
+    return cache_service.get_text_sync(_run_status_key(run_id)) == "cancelled"
 
 
 async def has_active_thread_memory(session_id: str) -> bool:
@@ -279,12 +317,12 @@ async def clear_session_runtime_state(session_id: str) -> None:
 SYSTEM_PROMPT = build_main_system_prompt(MEMORY_ROOT)
 
 
-def _build_model():
+def _build_model(model_spec: AgentModelSpec):
     """构造 deep agent 使用的聊天模型。"""
     return init_chat_model(
-        model=f"openai:{settings.agent_llm_model}",
-        api_key=settings.agent_llm_api_key,
-        base_url=settings.agent_llm_base_url,
+        model=f"openai:{model_spec.model}",
+        api_key=model_spec.api_key,
+        base_url=model_spec.base_url,
         temperature=0.3,
     )
 
@@ -354,10 +392,10 @@ async def _delete_checkpoint_thread(checkpointer: Any, thread_id: str) -> None:
 
 async def close_agent_runtime() -> None:
     """关闭 agent 运行时资源，主要用于释放 SQLite checkpoint 连接。"""
-    global _AGENT, _CHECKPOINTER, _CHECKPOINTER_CONTEXT
+    global _CHECKPOINTER, _CHECKPOINTER_CONTEXT
 
     async with _AGENT_LOCK:
-        _AGENT = None
+        _AGENT_CACHE.clear()
 
     async with _CHECKPOINTER_LOCK:
         context = _CHECKPOINTER_CONTEXT
@@ -367,30 +405,34 @@ async def close_agent_runtime() -> None:
     if context is not None and hasattr(context, "__aexit__"):
         await context.__aexit__(None, None, None)
 
+    await cache_service.close_cache()
+
 
 def get_store():
     """返回 deep agent 运行时共用的内存存储。"""
     return InMemoryStore()
 
 
-async def get_agent():
+async def get_agent(model_provider: str | None = None):
     """创建单例 deep agent，并给每个 subagent 绑定对应工具集。"""
-    global _AGENT
+    model_spec = resolve_agent_model_spec(model_provider)
+    cache_key = model_spec.provider
 
-    if _AGENT is not None:
-        return _AGENT
+    if cache_key in _AGENT_CACHE:
+        return _AGENT_CACHE[cache_key]
 
     async with _AGENT_LOCK:
-        if _AGENT is not None:
-            return _AGENT
+        if cache_key in _AGENT_CACHE:
+            return _AGENT_CACHE[cache_key]
 
-        _AGENT = await _build_agent()
-        return _AGENT
+        agent = await _build_agent(model_spec)
+        _AGENT_CACHE[cache_key] = agent
+        return agent
 
 
-async def _build_agent():
+async def _build_agent(model_spec: AgentModelSpec):
     """创建 deep agent 实例。"""
-    model = _build_model()
+    model = _build_model(model_spec)
     checkpointer = await get_checkpointer()
     store = get_store()
 
@@ -650,6 +692,88 @@ def _build_tool_call_detail(entry: ToolLedgerEntry) -> dict[str, Any]:
         }
     )
     return payload
+
+
+def _build_run_trace(
+    *,
+    run_id: str,
+    session_id: str,
+    started_at: str,
+    completed_at: str,
+    latency_ms: float,
+    used_subagents: list[str],
+    tool_calls: list[dict[str, Any]],
+    sources: list[str],
+    event_count: int,
+    context_compression: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a frontend-friendly trace graph summary for a completed run."""
+    failed_tools = [item for item in tool_calls if item.get("runtime_status") == "error"]
+    network_tools = [item for item in tool_calls if item.get("requires_network") is True]
+    timeline: list[dict[str, Any]] = [
+        {
+            "type": "run",
+            "status": "started",
+            "label": "Agent run started",
+            "timestamp": started_at,
+        }
+    ]
+    timeline.extend(
+        {
+            "type": "subagent",
+            "status": "started",
+            "label": name,
+            "name": name,
+        }
+        for name in used_subagents
+    )
+    timeline.extend(
+        {
+            "type": "tool",
+            "status": item.get("runtime_status") or item.get("status"),
+            "label": item.get("display_name") or item.get("name"),
+            "name": item.get("name"),
+            "category": item.get("category"),
+            "latency_ms": item.get("latency_ms"),
+            "requires_network": item.get("requires_network"),
+            "source_type": item.get("source_type"),
+            "source_name": item.get("source_name"),
+            "error": item.get("error"),
+        }
+        for item in tool_calls
+    )
+    timeline.append(
+        {
+            "type": "run",
+            "status": "completed",
+            "label": "Agent run completed",
+            "timestamp": completed_at,
+            "latency_ms": latency_ms,
+        }
+    )
+
+    return {
+        "trace_id": run_id,
+        "run_id": run_id,
+        "session_id": session_id,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "duration_ms": latency_ms,
+        "event_count": event_count,
+        "metrics": {
+            "subagent_count": len(used_subagents),
+            "tool_call_count": len(tool_calls),
+            "network_tool_call_count": len(network_tools),
+            "failed_tool_call_count": len(failed_tools),
+            "source_count": len(sources),
+            "context_compression_applied": bool(context_compression.get("applied")),
+        },
+        "subagents": [{"name": name, "status": "started"} for name in used_subagents],
+        "tools": tool_calls,
+        "sources": sources,
+        "context_compression": context_compression,
+        "timeline": timeline,
+    }
 
 
 def _extract_reply(result: dict[str, Any]) -> str:
@@ -947,6 +1071,9 @@ def _normalize_event(
 def _build_final_response(
     result: dict[str, Any],
     session_id: str,
+    run_id: str,
+    model_spec: AgentModelSpec,
+    started_at: str,
     event_texts: list[str],
     ledger: RunLedger,
     context_compression: dict[str, Any],
@@ -960,6 +1087,19 @@ def _build_final_response(
     tool_calls = ledger.tool_details()
     sources = _collect_sources(reply)
     latency_ms = round((perf_counter() - start) * 1000, 2)
+    completed_at = _utc_timestamp()
+    trace = _build_run_trace(
+        run_id=run_id,
+        session_id=session_id,
+        started_at=started_at,
+        completed_at=completed_at,
+        latency_ms=latency_ms,
+        used_subagents=used_subagents,
+        tool_calls=tool_calls,
+        sources=sources,
+        event_count=len(event_texts),
+        context_compression=context_compression,
+    )
 
     logger.info(
         "Agent run completed: session_id=%s, used_subagents=%s, tools=%s, latency_ms=%s",
@@ -972,12 +1112,16 @@ def _build_final_response(
     return {
         "reply": reply,
         "session_id": session_id,
+        "run_id": run_id,
+        "model_provider": model_spec.provider,
+        "model_name": model_spec.model,
         "used_subagents": used_subagents,
         "tool_calls_summary": tool_calls_summary,
         "tool_calls": tool_calls,
         "sources": sources,
         "latency_ms": latency_ms,
         "context_compression": context_compression,
+        "trace": trace,
         "error": None,
     }
 
@@ -986,6 +1130,7 @@ async def stream_agent_events(
     message: str,
     session_id: str = "default",
     run_id: str | None = None,
+    model_provider: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """流式产出标准化运行事件，供 API 层转发为 SSE。"""
     session_id = _normalize_session_id(session_id)
@@ -993,8 +1138,10 @@ async def stream_agent_events(
         run = create_run(session_id)
         run_id = run.run_id
 
-    agent = await get_agent()
+    model_spec = resolve_agent_model_spec(model_provider)
+    agent = await get_agent(model_spec.provider)
     start = perf_counter()
+    started_at = _utc_timestamp()
     final_result: dict[str, Any] | None = None
     event_texts: list[str] = []
     ledger = RunLedger()
@@ -1069,8 +1216,7 @@ async def stream_agent_events(
             config={"configurable": {"thread_id": session_id}, "recursion_limit": 100},
             version="v2",
         ):
-            run = get_run(current_run_id)
-            if run and run.cancel_event.is_set():
+            if _is_run_cancelled(current_run_id):
                 yield _build_stream_event(
                     "stopped",
                     session_id,
@@ -1139,15 +1285,25 @@ async def stream_agent_events(
         session_id,
         current_run_id,
         sequence,
-        _build_final_response(final_result or {}, session_id, event_texts, ledger, context_compression, start),
+        _build_final_response(
+            final_result or {},
+            session_id,
+            current_run_id,
+            model_spec,
+            started_at,
+            event_texts,
+            ledger,
+            context_compression,
+            start,
+        ),
     )
 
 
-async def run_agent(message: str, session_id: str = "default") -> dict[str, Any]:
+async def run_agent(message: str, session_id: str = "default", model_provider: str | None = None) -> dict[str, Any]:
     """运行主 agent，并返回可直接给 API 层使用的结构化结果。"""
     final_payload: dict[str, Any] | None = None
 
-    async for stream_event in stream_agent_events(message, session_id):
+    async for stream_event in stream_agent_events(message, session_id, model_provider=model_provider):
         if stream_event["type"] == "final":
             final_payload = stream_event["payload"]
 

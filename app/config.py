@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     memory_recall_score_threshold: float | None = None
     memory_recent_history_limit: int = 4
     memory_prompt_char_budget: int = 1200
+    memory_save_user_raw: bool = False
+    memory_min_user_chars: int = 12
+    memory_min_assistant_chars: int = 80
+    memory_context_summary_chars: int = 1200
     mem0_collection_name: str = "mem0_chat_memory"
     mem0_llm_provider: str = "deepseek"
     mem0_llm_model: str = ""
@@ -105,6 +109,21 @@ class Settings(BaseSettings):
 
     # Search
     tavily_api_key: str = ""
+
+    # Redis cache / runtime state
+    redis_enabled: bool = False
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    redis_key_prefix: str = "jobcopilot"
+    redis_default_ttl_seconds: int = 600
+    redis_run_lock_ttl_seconds: int = 900
+    tavily_cache_enabled: bool = True
+    tavily_cache_ttl_seconds: int = 1800
+
+    # Tool safety
+    tool_security_enabled: bool = True
+    tool_allowed_domains: str = ""
+    tool_security_redact_inputs: bool = True
+    tool_security_preview_chars: int = 160
 
     # MCP
     mcp_host: str = "127.0.0.1"

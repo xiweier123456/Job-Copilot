@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 
 from app.config import settings
+from app.services.cache_service import build_cache_key, get_json, hash_payload, set_json
 
 
 class TavilyError(RuntimeError):
@@ -20,6 +21,12 @@ def _require_api_key() -> str:
 
 async def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     api_key = _require_api_key()
+    cache_key = build_cache_key("tavily", path.strip("/"), hash_payload(payload))
+    if settings.tavily_cache_enabled:
+        cached = await get_json(cache_key)
+        if isinstance(cached, dict):
+            return cached
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -36,6 +43,8 @@ async def _post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     data = response.json()
     if isinstance(data, dict) and data.get("error"):
         raise TavilyError(f"Tavily 请求失败：{data['error']}")
+    if settings.tavily_cache_enabled:
+        await set_json(cache_key, data, ttl_seconds=settings.tavily_cache_ttl_seconds)
     return data
 
 

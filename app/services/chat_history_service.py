@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,62 @@ def _write_history_sync(session_id: str, turns: list[dict[str, Any]]) -> None:
     )
 
 
+def _file_mtime_iso(path: Path) -> str:
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+
+
+def _session_title(turns: list[dict[str, Any]], fallback: str) -> str:
+    for turn in turns:
+        title = str(turn.get("user_message") or "").strip()
+        if title:
+            return title[:28] + ("..." if len(title) > 28 else "")
+    return fallback
+
+
+def _build_session_summary_sync(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(data, list):
+        return None
+
+    session_id = path.stem
+    if data:
+        session_id = str(data[0].get("session_id") or session_id)
+
+    first_turn = data[0] if data else {}
+    last_turn = data[-1] if data else {}
+    message_count = sum(
+        int(bool(str(turn.get("user_message") or "").strip())) + int(bool(str(turn.get("assistant_message") or "").strip()))
+        for turn in data
+        if isinstance(turn, dict)
+    )
+
+    return {
+        "session_id": session_id,
+        "title": _session_title(data, session_id),
+        "turn_count": len(data),
+        "message_count": message_count,
+        "created_at": str(first_turn.get("created_at") or _file_mtime_iso(path)),
+        "updated_at": str(last_turn.get("created_at") or _file_mtime_iso(path)),
+    }
+
+
+def _list_chat_sessions_sync() -> list[dict[str, Any]]:
+    if not HISTORY_ROOT.exists():
+        return []
+
+    sessions = []
+    for path in HISTORY_ROOT.glob("*.json"):
+        summary = _build_session_summary_sync(path)
+        if summary is not None:
+            sessions.append(summary)
+
+    return sorted(sessions, key=lambda item: item.get("updated_at") or "", reverse=True)
+
+
 async def get_chat_history(session_id: str, limit: int | None = None) -> list[dict[str, Any]]:
     """
     异步读取某个 session 的 transcript。
@@ -65,6 +122,11 @@ async def get_chat_history(session_id: str, limit: int | None = None) -> list[di
     if limit is not None and limit > 0:
         return turns[-limit:]
     return turns
+
+
+async def list_chat_sessions() -> list[dict[str, Any]]:
+    """Return lightweight summaries for the conversation sidebar."""
+    return await asyncio.to_thread(_list_chat_sessions_sync)
 
 
 async def save_chat_turn(turn: dict[str, Any]) -> dict[str, Any]:
